@@ -1,0 +1,2801 @@
+MODULE BFIBase(SYSMODULE,NOSTEPIN)
+
+
+! GLOBAL VARIABLES
+!-----------------------------------------------------------------------------
+! Structure for keeping frame data
+RECORD frame
+	num X;
+	num Y;
+	num Z;
+	num A;
+	num B;
+	num C;
+ENDRECORD
+
+!CONST string st_Version_BFIBASE:="1.0.1 BFIBase";		! 2012-08-07	Initial version
+!CONST string st_Version_BFIBASE:="1.0.2 BFIBase";		! 2012-09-14	Minor modifications after BMW request
+!CONST string st_Version_BFIBASE:="1.0.3 BFIBase";		! 2012-12-13	a) Minor modifications after BMW request
+!										b) Support for 3-14 & 3-16 commands
+!										c) Added hysterisis compensation during correction
+!CONST string st_Version_BFIBASE:="1.0.4 BFIBase";		! 2013-02-21	a) Added par5 in 2-9  
+!										b) Added case par5=5 in 2-3 CorrectionFit 
+!										c) Added par6 for 1-1 (Selective Training)
+!										d) Added 2-11 case for average fitting (average fitting in robot side removed)
+!CONST string st_Version_BFIBASE:="1.0.5 BFIBase";		! 2013-03-26	Update of the average value at the robot after successful fitting (if the optional boolean value is true)
+!CONST string st_Version_BFIBASE:="1.0.6 BFIBase";		! 2013-04-11	Error handling with PLC
+!CONST string st_Version_BFIBASE:="1.0.7 BFIBase";		! 2013-06-11	a) Error signal PLC_do_BF_Meas_Err
+!										b) Screwing correction error handling
+!CONST string st_Version_BFIBASE:="1.0.8 BFIBase";		! 2013-08-24	Updating and fixing error handling
+!CONST string st_Version_BFIBASE:="1.0.9 BFIBase";		! 2014-05-03	a) Increase matrix to 10 models for average correction value
+!										b) Comment some logging messages after successful fitting that were causing delays
+!										c) Move variable pose_HystComp to BFIUser																
+!CONST string st_Version_BFIBASE:="1.0.10 BFIBase";		! 2014-07-17	a) PLC_do_BF_Meas_Err and PLC_do_BF_Busy signals are reset during initialization
+!										b) Error code for maximum fitting steps (par5=5) is correctly parsed from the fitting routine
+!										c) Gripper exchange robot command is added into the BF_SETUP routine (path 1 - [7])
+!										d) Usage of BF_Initialize with assignment of correct tool and workobject (plus parameter b_UseCurrentTool for compatibility reasons
+!										e) Writting of some user logging messages has become optional (CONST b_EnableDebugLog in BFIUser.mod)
+!										f) Some code refactoring (moved some CONST values to BFIUser.mod file, deleting commented code, etc)
+!										g) MsgBox in reference measurement is not displayed anymore in automatic mode
+!CONST string st_Version_BFIBASE:="1.0.10.1 BFIBase";		! 2014-12-20	Integration of 5-2 command (Release/allocate sensors)
+!CONST string st_Version_BFIBASE:="1.0.11 BFIBase";		! 2015-01-10	a) Error handling after communication failure
+!										b) Logging file messages improved
+!CONST string st_Version_BFIBASE:="1.0.12 BFIBase";		! 2015-01-15	Endless best-fit retries on continue
+!CONST string st_Version_BFIBASE:="1.0.13 BFIBase";		! 2015-01-20	Handcoded thresholds for best-fit by average
+!CONST string st_Version_BFIBASE:="1.0.14 BFIBase";		! 2015-03-19	Changes with average
+!CONST string st_Version_BFIBASE:="1.0.15 BFIBase";		! 2015-05-20	Integrate Best Bit Process Time Measurement (do_BF_Meas_Time )
+!CONST string st_Version_BFIBase:="1.2.0 BFIBASE";		! 2015-02-17	Integration of Regensburg functionalities into Oxford branch
+CONST string st_Version_BFIBase:="1.2.1 BFIBASE";		! 2015-06-04	Merged version
+
+! Constants used by the error handlers
+CONST errnum en_ERR_1:=1;
+CONST errnum en_ERR_2:=2;
+CONST errnum en_ERR_3:=3;
+CONST errnum en_ERR_4:=4;
+CONST errnum en_ERR_5:=5;
+CONST errnum en_ERR_6:=6;
+CONST errnum en_ERR_7:=7;
+CONST errnum en_ERR_8:=8;
+CONST errnum en_ERR_9:=9;
+CONST errnum en_ERR_10:=10;
+
+! Communication global data
+LOCAL VAR socketdev s_Socket;
+LOCAL VAR num n_Inos_INPAR{6};
+LOCAL VAR frame fr_Inos_TCP;
+LOCAL VAR frame fr_Inos_Work;
+LOCAL VAR string st_BestFit_IP;
+LOCAL VAR num n_BestFit_PORT;
+
+! Backup frames for initial robot TCP and Work
+LOCAL VAR pose pose_InosBakTCP;
+LOCAL VAR pose pose_InosBakWork;
+
+LOCAL VAR num n_Inos_BaseNr;
+PERS num n_Inos_Type:=4;
+PERS num n_Inos_Process:=1;
+
+! Decides whether the average wobj offset will be updated
+LOCAL VAR bool b_Update_Average;
+
+! Strings for message boxes (multilingual)
+LOCAL VAR string st_BFIBoxLine1{3};
+
+! String for logging messages (multilingual)
+LOCAL VAR string st_LogMessage;
+
+
+! Global INOS error status variable
+VAR num n_Inos_Error_Code;
+! 0 -> No error
+! 1 -> Ethernet communication error
+! 2 -> Failed measurements error
+! 3 -> Maximum number of correction steps exceeded
+! 4 -> Correction out of limits
+! 5 -> Wrong function call parameter error
+! 6 -> Measurements out of tolerance
+! 7 -> Collision detected by software
+! 8 -> Unknown error
+! 9 -> Average Fitting Error (HpFit calculation)
+
+! Global variable that indicates connection status with INOS station
+VAR bool b_connected;
+
+PROC BF_INOS(num n_PAR_MODE, num n_PAR_FUNC, num n_PAR_MODEL, num n_PAR_TYPE, num n_PAR_REPEAT, num n_PAR_BASE \bool b_PAR_UPD_AVG)
+!************************************************
+!*			BF_INOS main Routine				*
+!************************************************
+!	This is the function called by the main program. ex BF_INOS(2,3,1,4,2,1,TRUE)
+!	The first 2 parameters decide the function that will be triggered
+!
+!	n_PAR_MODE		->	Mode of operation (training, correction, measurement, etc)
+!	n_PAR_FUN		->	Function for each mode
+!	n_PAR_MODEL		->	Model number (1-based)
+!	n_PAR_TYPE		->	Process number (1-based)
+!	n_PAR_REPEAT		->	Variable meaning depending on selected function
+!	n_PAR_BASE		->	Reserved for future use (value is used only for selective training)
+!	b_PAR_UPD_AVG		->	TRUE = update average correction for this process
+!************************************************
+
+    IF b_HPFit = FALSE Set PLC_do_BF_Meas_Time;
+
+	! Currently not used. Reserved for future use
+	n_Inos_BaseNr:=n_PAR_BASE;
+
+	! Decides whether the average correction should be updated for this process
+	IF Present(b_PAR_UPD_AVG) THEN
+		b_Update_Average:=b_PAR_UPD_AVG;
+	ELSE
+		b_Update_Average:=FALSE;
+	ENDIF
+
+	! Reset error flag
+	n_Inos_Error_Code:=0;
+	
+	
+	! No meaning in doing anything if application is not running
+	IF DInput(PLC_di_NoApplication) = 0 THEN
+	
+		! Log input parameters
+		st_LogMessage:="MSG -> BF_INOS("+ValToStr(n_PAR_MODE)+", "+ValToStr(n_PAR_FUNC)+", "+ValToStr(n_PAR_MODEL)+", "+ValToStr(n_PAR_TYPE)+", "+ValToStr(n_PAR_REPEAT)+", "+ValToStr(n_PAR_BASE)+","+ValToStr(b_PAR_UPD_AVG)+")";
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+	
+		TEST n_PAR_MODE
+		
+		CASE 1:
+			Set PLC_do_BF_Busy;
+			if PLC_di_BF_OutOfOrder = 0 BF_SETUP  n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT,n_PAR_BASE;
+			Reset PLC_do_BF_Busy;
+			
+		CASE 2:
+			Set PLC_do_BF_Busy;
+			BF_CORRECTION  n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT,n_PAR_BASE;
+			Reset PLC_do_BF_Busy;
+			
+		CASE 3:
+			Set PLC_do_BF_Busy;
+			if PLC_di_BF_OutOfOrder = 0 BF_MEASURE  n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT,n_PAR_BASE;
+			Reset PLC_do_BF_Busy;
+            
+	        CASE 5:
+			Set PLC_do_BF_Busy;
+			if PLC_di_BF_OutOfOrder = 0 BF_SHARE_CAMERAS  n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT,n_PAR_BASE;
+			Reset PLC_do_BF_Busy;
+			
+		DEFAULT:
+			RAISE en_ERR_1;
+			
+		ENDTEST
+		
+	ENDIF
+	
+    IF b_HPFit = FALSE Reset PLC_do_BF_Meas_Time;    
+
+! Error handling
+ERROR
+
+	MsgBox_Clear;
+	st_MsgBoxHeader:=["INOS Error", "INOS Fehler", "???"];
+	
+	TEST ERRNO
+	
+	CASE en_ERR_1:
+	
+		n_Inos_Error_Code:=5;
+
+		st_BFIBoxLine1:=["Error in calling Best-Fit INOS routine", "Fehler beim Aufruf der Best-Fit INOS Rountine", "???"];
+		st_MsgBoxLine3{1}:="Mode parameter is invalid: "+ValToStr(n_PAR_MODE);
+		st_MsgBoxLine3{2}:="Modus Parameter ist falsch: "+ValToStr(n_PAR_MODE);
+		st_MsgBoxLine3{3}:="???";
+		
+		n_MsgBoxPLC_Error:=20818;		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		Set PLC_do_BF_Meas_Err;
+		!The following message should appear until the error is fixed.
+		MsgBox \Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		Reset PLC_do_BF_Meas_Err;
+		
+	ENDTEST
+    
+    RETURN;
+	
+ENDPROC	!(BF_INOS)
+
+
+FUNC bool BF_IOINIT (num n_TOUT, string st_ipstring, num n_portnum) 
+!************************************************
+!*				BF_IOINIT Routine				*
+!************************************************
+!	Creates a TCP/IP communication link with the Best-Fit station PC
+!
+!	n_TOUT		->	Timeout for creating connection with the PC (in seconds)
+!	st_ipstring	->	String containing the IP address of the PC (ex. "192.168.1.110")
+!	n_portnum	->	Listening port number of the PC (default 1006)
+!************************************************
+	!In case that PLC user decides to trigger again the BF_IOINIT
+	VAR bool b_AllowRetry:=FALSE; 
+	
+	n_Inos_INPAR:=[0,0,0,0,0,0];
+	fr_Inos_TCP:=[0,0,0,0,0,0];
+	fr_Inos_Work:=[0,0,0,0,0,0];
+	
+	WAITTIME 0.1;
+	SocketCreate s_Socket;
+	
+	! Connect to remote PC using IP: 'st_ipstring' and port number: 'n_portnum'
+	SocketConnect s_Socket, st_ipstring, n_portnum \Time:=n_TOUT;
+	
+	! Error code is handled in upper level
+	!n_Inos_Error_Code:=0;
+    
+	! Store ip and port in case re-connection is needed
+	st_BestFit_IP:=st_ipstring;
+	n_BestFit_PORT:=n_portnum;
+	
+	RETURN TRUE;
+ 
+! Error handling
+ERROR
+	b_AllowRetry:= FALSE;
+	MsgBox_Clear;
+	st_MsgBoxHeader:=["INOS Communication Error", "INOS Kommunikationsfehler", "???"];
+	st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+	st_MsgBoxbutton5:=["Abort", "Abbruch", "???"];
+	
+	TEST ERRNO
+	
+	CASE ERR_SOCK_TIMEOUT:
+		st_BFIBoxLine1:=["INOS Connection error", "INOS Verbindungsfehler", "???"];
+		st_MsgBoxLine3{1}:="Failed to connect to IP:"+st_ipstring;
+		st_MsgBoxLine4{1}:="port:"+ValToStr(n_portnum);
+		st_MsgBoxLine5{1}:="Timeout exceeded: ("+ValToStr(n_TOUT)+" sec)";
+		
+		st_MsgBoxLine3{2}:="Konnte keine Verbindung mit IP:"+st_ipstring+"herstellen";
+		st_MsgBoxLine4{2}:="port:"+ValToStr(n_portnum);
+		st_MsgBoxLine5{2}:="Timeout abgelaufen: ("+ValToStr(n_TOUT)+" sec)";
+		
+		st_MsgBoxLine3{3}:="???";
+		
+	DEFAULT: 
+		st_BFIBoxLine1:=["INOS Connection error", "INOS Verbindungsfehler", "???"];
+		st_MsgBoxLine3{1}:="Unhandled exception in connecting IP:"+st_ipstring;
+		st_MsgBoxLine4{1}:="port:"+ValToStr(n_portnum);
+		
+		st_MsgBoxLine3{2}:="Unbehandelte Ausnahme in Verbindung mit IP:"+st_ipstring;
+		st_MsgBoxLine4{2}:="port:"+ValToStr(n_portnum);
+		
+		st_MsgBoxLine3{3}:="???";
+		
+	ENDTEST
+	
+	! Log error
+	st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+	Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+	
+	n_MsgBoxPLC_Error:=20805;
+	Set PLC_do_BF_Meas_Err;
+	MsgBox \diBreakSignal:=PlC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+
+	IF (DInput(PLC_di_BF_Repeat)=1 OR n_MsgBoxAnswer=1) THEN
+		b_AllowRetry:=TRUE;
+	ENDIF
+
+	Reset PLC_do_BF_Meas_Err;
+
+	! Try to reconnect
+	IF b_AllowRetry THEN
+		BF_IOEXIT;
+        	b_connected:=BF_IOINIT(n_TOUT, st_ipstring, n_portnum);
+		RETURN b_connected;
+	ENDIF
+	
+	! Error code is handled in upper level
+	!n_Inos_Error_Code:=1;
+	RETURN FALSE;
+	
+ENDFUNC	!(BF_IOINIT)
+
+
+PROC BF_IOEXIT ()
+!************************************************
+!				BF_IOEXIT Routine				*
+!************************************************
+!	Closes the TCP/IP communication link with the Best-Fit station PC
+!************************************************
+
+	SocketClose s_Socket;
+	WAITTIME 0.1;
+
+ENDPROC	!(BF_IOEXIT)
+
+
+LOCAL FUNC bool BF_IOWRITE(num n_PAR_MODE,num n_PAR_FUNC,num n_PAR_MODEL,num n_PAR_TYPE,num n_PAR_REPEAT,num n_PAR_BASE)
+!************************************************
+!*				BF_IOWRITE Routine				*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+!	n_PAR_MODE		-> parameter 1
+!	n_PAR_FUNC		-> parameter 2
+!	n_PAR_MODEL		-> parameter 3
+!	n_PAR_TYPE		-> parameter 4
+!	n_PAR_REPEAT		-> parameter 5
+!	n_PAR_BASE		-> parameter 6
+!************************************************
+
+	VAR string st_str;
+	VAR num n_length;
+	VAR string st_tempStr;
+	VAR rawbytes rb_strpacket;			! String to write the whole packet.
+	VAR string st_parpacket;
+	VAR string st_tcppacket;
+	VAR string st_workpacket;
+	VAR num n_len;
+	VAR num n_currCoordinate;
+	VAR robtarget rt_CurrentRob;
+	VAR pose pose_CurrWork;
+	VAR frame fr_CurrTCP;
+	VAR frame fr_CurrWork;
+	VAR frame fr_CurrTCP1000;
+	VAR frame fr_CurrWork1000;
+	VAR string st_STRPAR_MODE;
+	VAR string st_STRPAR_FUNC;
+	VAR string st_STRPAR_MODEL;
+	VAR string st_STRPAR_TYPE;
+	VAR string st_STRPAR_REPEAT;
+	VAR string st_STRPAR_BASE;
+	
+	! Return failure if not connected
+	IF (b_connected = FALSE) THEN
+		RETURN FALSE;
+	ENDIF
+	
+	! Read Current Robot Position of the tool (CurrentFrame).---------------------------------------------
+	rt_CurrentRob:= CRobT(\Tool:=t_inosTool \WObj:=wobj_inosWobj);  			
+	fr_CurrTCP:=BF_RobTargetToFrame(rt_CurrentRob);
+	
+	fr_CurrTCP1000.X:=ROUND(fr_CurrTCP.X*1000);
+	fr_CurrTCP1000.Y:=ROUND(fr_CurrTCP.Y*1000);
+	fr_CurrTCP1000.Z:=ROUND(fr_CurrTCP.Z*1000);
+	fr_CurrTCP1000.A:=ROUND(fr_CurrTCP.A*1000);
+	fr_CurrTCP1000.B:=ROUND(fr_CurrTCP.B*1000);
+	fr_CurrTCP1000.C:=ROUND(fr_CurrTCP.C*1000);
+	
+	! Read Current Robot Work (fr_CurrWork).---------------------------------------------
+	pose_CurrWork:=wobj_inosWobj.oframe;
+	fr_CurrWork.X:=pose_CurrWork.trans.x;
+	fr_CurrWork.Y:=pose_CurrWork.trans.y;
+	fr_CurrWork.Z:=pose_CurrWork.trans.z;
+	fr_CurrWork.A:=EulerZYX(\Z,pose_CurrWork.rot);
+	fr_CurrWork.B:=EulerZYX(\Y,pose_CurrWork.rot);
+	fr_CurrWork.C:=EulerZYX(\X,pose_CurrWork.rot);
+	
+	fr_CurrWork1000.X:=ROUND(fr_CurrWork.X*1000);
+	fr_CurrWork1000.Y:=ROUND(fr_CurrWork.Y*1000);
+	fr_CurrWork1000.Z:=ROUND(fr_CurrWork.Z*1000);
+	fr_CurrWork1000.A:=ROUND(fr_CurrWork.A*1000);
+	fr_CurrWork1000.B:=ROUND(fr_CurrWork.B*1000);
+	fr_CurrWork1000.C:=ROUND(fr_CurrWork.C*1000);
+	
+	! Convert Parameters to a string packet -----------------------------------------    
+	ClearRawBytes rb_strpacket;
+	IF StrLen(ValTOStr(n_PAR_MODE))>1 THEN
+		st_STRPAR_MODE:=ValToStr(n_PAR_MODE);
+	ELSE
+		st_STRPAR_MODE:="0"+ValToStr(n_PAR_MODE);
+	ENDIF
+	
+	IF StrLen(ValTOStr(n_PAR_FUNC))>1 THEN
+		st_STRPAR_FUNC:=ValToStr(n_PAR_FUNC);
+	ELSE
+		st_STRPAR_FUNC:="0"+ValToStr(n_PAR_FUNC);
+	ENDIF
+	
+	IF StrLen(ValTOStr(n_PAR_MODEL))>1 THEN
+		st_STRPAR_MODEL:=ValToStr(n_PAR_MODEL);
+	ELSE
+		st_STRPAR_MODEL:="0"+ValToStr(n_PAR_MODEL);
+	ENDIF
+	
+	IF StrLen(ValTOStr(n_PAR_TYPE))>1 THEN
+		st_STRPAR_TYPE:=ValToStr(n_PAR_TYPE);
+	ELSE
+		st_STRPAR_TYPE:="0"+ValToStr(n_PAR_TYPE);
+	ENDIF
+	
+	IF StrLen(ValTOStr(n_PAR_REPEAT))>1 THEN
+		st_STRPAR_REPEAT:=ValToStr(n_PAR_REPEAT);
+	ELSE
+		st_STRPAR_REPEAT:="0"+ValToStr(n_PAR_REPEAT);
+	ENDIF
+	
+	IF StrLen(ValTOStr(n_PAR_BASE))>1 THEN
+		st_STRPAR_BASE:=ValToStr(n_PAR_BASE);
+	ELSE
+		st_STRPAR_BASE:="0"+ValToStr(n_PAR_BASE);
+	ENDIF
+	
+	st_parpacket:=st_STRPAR_MODE+st_STRPAR_FUNC+st_STRPAR_MODEL+st_STRPAR_TYPE+st_STRPAR_REPEAT+st_STRPAR_BASE;
+	!--------------------------------------------------------------------------------
+	
+	
+	!Create a string packet containing the TCP   ------------------------------------
+	FOR index FROM 1 TO 6 DO
+	
+		TEST index
+		
+		CASE 1:
+			n_currCoordinate:=fr_CurrTCP1000.X;
+		CASE 2:
+			n_currCoordinate:=fr_CurrTCP1000.Y;
+		CASE 3:
+			n_currCoordinate:=fr_CurrTCP1000.Z;
+		CASE 4:
+			n_currCoordinate:=fr_CurrTCP1000.A;
+			CASE 5:
+			n_currCoordinate:=fr_CurrTCP1000.B;
+		CASE 6:
+			n_currCoordinate:=fr_CurrTCP1000.C;
+		
+		ENDTEST
+			
+		IF n_currCoordinate>=0 THEN
+			st_str:=ValToStr(n_currCoordinate);			
+			n_length:=StrLen(st_str);
+			FOR i FROM 1 TO 8-n_length STEP 1 DO
+				st_tempstr:=st_tempstr+"0";
+			ENDFOR
+			st_tempstr:=st_tempstr+st_str;
+			st_str:="";
+		ELSE
+			st_str:=ValToStr(n_currCoordinate);
+			n_length:=StrLen(st_str);
+			IF n_length=8 THEN
+				! Leave string as it is
+				st_tempstr:=st_str;
+				st_str:="";
+			ELSE	
+				st_str:=StrMap(st_str,"-","0");
+				IF n_length=7 THEN
+					st_tempstr:="-"+st_str;
+					st_str:="";
+				ELSE
+					FOR i FROM 1 TO 7-n_length STEP 1 DO
+						st_tempstr:=st_tempstr+"0";
+					ENDFOR
+					st_tempstr:="-"+st_tempstr+st_str;
+					st_str:="";
+				ENDIF
+			ENDIF
+		ENDIF
+		
+		st_tcppacket:=st_tcppacket+st_tempstr;
+		st_tempstr:="";
+		
+	ENDFOR
+	
+	!Create a string packet containing the Work   ------------------------------------
+	FOR index FROM 1 TO 6 DO
+	
+		TEST index
+		
+		CASE 1:
+			n_currCoordinate:=fr_CurrWork1000.X;
+		CASE 2:
+			n_currCoordinate:=fr_CurrWork1000.Y;
+		CASE 3:
+			n_currCoordinate:=fr_CurrWork1000.Z;
+		CASE 4:
+			n_currCoordinate:=fr_CurrWork1000.A;
+		CASE 5:
+			n_currCoordinate:=fr_CurrWork1000.B;
+		CASE 6:
+			n_currCoordinate:=fr_CurrWork1000.C;
+		
+		ENDTEST
+		
+		IF n_currCoordinate>=0 THEN
+			st_str:=ValToStr(n_currCoordinate);			
+			n_length:=StrLen(st_str);
+			FOR i FROM 1 TO 8-n_length STEP 1 DO
+				st_tempstr:=st_tempstr+"0";
+			ENDFOR
+			st_tempstr:=st_tempstr+st_str;
+			st_str:="";
+		ELSE
+			st_str:=ValToStr(n_currCoordinate);
+			n_length:=StrLen(st_str);
+			IF n_length=8 THEN
+				! Leave string as it is
+				st_tempstr:=st_str;
+				st_str:="";
+			ELSE
+				st_str:=StrMap(st_str,"-","0");
+				IF n_length=7 THEN
+					st_tempstr:="-"+st_str;
+					st_str:="";
+				ELSE
+					FOR i FROM 1 TO 7-n_length STEP 1 DO
+						st_tempstr:=st_tempstr+"0";
+					ENDFOR
+					st_tempstr:="-"+st_tempstr+st_str;
+					st_str:="";
+				ENDIF
+			ENDIF
+		ENDIF
+		
+		st_workpacket:=st_workpacket+st_tempstr;
+		st_tempstr:="";
+		
+	ENDFOR
+	!--------------------------------------------------------------------------------
+	
+	
+	!Create the complete string packet   ---------------------------------------------
+	PackRawBytes  st_parpacket,rb_strpacket,(RawBytesLen(rb_strpacket)+1) \ASCII;
+	PackRawBytes  st_tcppacket,rb_strpacket,(RawBytesLen(rb_strpacket)+1) \ASCII;
+	PackRawBytes  st_workpacket,rb_strpacket,(RawBytesLen(rb_strpacket)+1) \ASCII;
+	
+	n_len:=RawBytesLen (rb_strpacket); 
+
+	!Send the Packet throught the Socket-----------------------------------------------
+	SocketSend s_Socket \RawData:=rb_strpacket;
+	
+	ClearRawBytes rb_strpacket;
+	
+	RETURN TRUE;
+
+! Error handling
+ERROR
+
+	! Communication error handling is done in upper level, so no message boxes should pop-up here
+	!MsgBox_Clear;
+	!st_MsgBoxHeader:=["INOS Communication Error", "INOS Kommunikationsfehler", "???"];
+	
+	TEST ERRNO
+	
+	CASE ERR_SOCK_TIMEOUT:
+		st_BFIBoxLine1:=["Error in BF_IOWRITE", "Fehler in BF_IOWRITE", "???"];
+		st_MsgBoxLine3:=["Failed to send data to INOS station. Timeout exceeded.", "Konnte keine Daten an INOS-PC senden: Timeout abgelaufen", "???"];
+		
+	CASE ERR_SOCK_CLOSED:
+		st_BFIBoxLine1:=["Error in BF_IOWRITE", "Fehler in BF_IOWRITE", "???"];
+		st_MsgBoxLine3:=["Failed to send data to INOS station. Broken connection", "Konnte keine Daten an INOS-PC senden: Verbindung unterbrochen", "???"];
+		
+	DEFAULT:
+		st_BFIBoxLine1:=["Error in BF_IOWRITE", "Fehler in BF_IOWRITE", "???"];
+		st_MsgBoxLine3:=["Unhandled exception in sending data to INOS Station.", "Unbehandelte Ausnahme beim Senden der Daten zu INOS-Station", "???"];
+		
+	ENDTEST
+	
+	! Log error
+	st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+	Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+
+	!n_MsgBoxPLC_Error:=20805;
+	!MsgBox \diBreakSignal:=PlC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+	n_Inos_Error_Code:=1;
+	RETURN FALSE;
+
+ENDFUNC	!(BF_IOWRITE)
+
+
+LOCAL FUNC bool BF_IOREAD(num n_TOUT)             
+!************************************************
+!*				BF_IOREAD Routine				*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+!	n_TOUT	-> data read timeout
+!************************************************
+
+	VAR num n_PAR{6};
+	VAR num n_PAR_MODE:=0; 			!parameters of the robot.
+	VAR num n_PAR_FUNC:=0;
+	VAR num n_PAR_MODEL:=0;
+	VAR num n_PAR_TYPE:=0;
+	VAR num n_PAR_REPEAT:=0;
+	VAR num n_PAR_BASE:=0;
+	VAR num n_Xpos:=0;				!TCP correction
+	VAR num n_Ypos:=0;
+	VAR num n_Zpos:=0;
+	VAR num n_angleA:=0;
+	VAR num n_angleB:=0;
+	VAR num n_angleC:=0;
+	VAR num n_Xworkpos:=0; 			!Work correction.
+	VAR num n_Yworkpos:=0;
+	VAR num n_Zworkpos:=0;
+	VAR num n_workangleA:=0;
+	VAR num n_workangleB:=0;
+	VAR num n_workangleC:=0;
+	VAR bool b_ok;
+	VAR num n_found;					
+	VAR string st_part;
+	VAR rawbytes rb_packet;			!save the packet that you read.				
+	VAR num n_len;
+	VAR string st_parpacket;
+	VAR string st_tcppacket;
+	VAR string st_workpacket;
+	
+	! Return failure if not connected
+	IF (b_connected = FALSE) THEN
+		RETURN FALSE;
+	ENDIF
+	
+	! Read From Socket  --------------------------------------------------------
+	SocketReceive s_Socket \Rawdata := rb_packet \Time:=n_TOUT;
+	UnpackRawBytes rb_packet, 1,st_parpacket\ASCII:=12;
+	UnpackRawBytes rb_packet, 13,st_tcppacket\ASCII:=48;
+	UnpackRawBytes rb_packet, 61,st_workpacket\ASCII:=48;
+
+	!Check if string is 108 -----------------------------------------------------
+	n_len := RawBytesLen(rb_packet);
+	IF n_len<>108 THEN 
+		RAISE en_ERR_1;
+	ENDIF
+	
+	!Distinguish the Parameters --------------------------------------------------						
+	st_part:=StrPart(st_parpacket,2,1);			
+	b_ok :=StrToVal(st_part,n_PAR_MODE);
+	st_part:=StrPart(st_parpacket,4,1);			
+	b_ok :=StrToVal(st_part,n_PAR_FUNC);
+	st_part:=StrPart(st_parpacket,6,1);		
+	b_ok :=StrToVal(st_part,n_PAR_MODEL);
+	st_part:=StrPart(st_parpacket,8,1);			
+	b_ok :=StrToVal(st_part,n_PAR_TYPE);
+	st_part:=StrPart(st_parpacket,10,1);	
+	b_ok :=StrToVal(st_part,n_PAR_REPEAT);
+	st_part:=StrPart(st_parpacket,12,1);			
+	b_ok :=StrToVal(st_part,n_PAR_BASE);
+	
+	!Distinguish the TCP --------------------------------------------------						
+	st_part:=StrPart(st_tcppacket,1,8);		
+	b_ok :=StrToVal(st_part,n_Xpos);
+	st_part:=StrPart(st_tcppacket,9,8);			
+	b_ok :=StrToVal(st_part,n_Ypos);
+	st_part:=StrPart(st_tcppacket,17,8);			
+	b_ok :=StrToVal(st_part,n_Zpos);
+	st_part:=StrPart(st_tcppacket,25,8);			
+	b_ok :=StrToVal(st_part,n_angleA);
+	st_part:=StrPart(st_tcppacket,33,8);			
+	b_ok :=StrToVal(st_part,n_angleB);
+	st_part:=StrPart(st_tcppacket,41,8);			
+	b_ok :=StrToVal(st_part,n_angleC);
+	
+	!Distinguish the Work --------------------------------------------------						
+	st_part:=StrPart(st_workpacket,1,8);		
+	b_ok :=StrToVal(st_part,n_Xworkpos);
+	st_part:=StrPart(st_workpacket,9,8);			
+	b_ok :=StrToVal(st_part,n_Yworkpos);
+	st_part:=StrPart(st_workpacket,17,8);			
+	b_ok :=StrToVal(st_part,n_Zworkpos);
+	st_part:=StrPart(st_workpacket,25,8);			
+	b_ok :=StrToVal(st_part,n_workangleA);
+	st_part:=StrPart(st_workpacket,33,8);			
+	b_ok :=StrToVal(st_part,n_workangleB);
+	st_part:=StrPart(st_workpacket,41,8);			
+	b_ok :=StrToVal(st_part,n_workangleC);
+	!--------------------------------------------------------------------------------
+	
+	
+	n_Xpos:=n_Xpos/1000;
+	n_Ypos:=n_Ypos/1000;
+	n_Zpos:=n_Zpos/1000;
+	n_angleA:= n_angleA/1000;				 
+	n_angleB:= n_angleB/1000;
+	n_angleC:= n_angleC/1000;
+	n_Xworkpos:= n_Xworkpos/1000;
+	n_Yworkpos:= n_Yworkpos/1000;
+	n_Zworkpos:= n_Zworkpos/1000;
+	n_workangleA:= n_workangleA/1000;			
+	n_workangleB:= n_workangleB/1000;
+	n_workangleC:= n_workangleC/1000;
+	
+	! Values in X,Y,Z,A,B,C ------------------------------------------------------
+	fr_Inos_TCP:=[n_Xpos,n_Ypos,n_Zpos,n_angleA,n_angleB,n_angleC];
+	
+	fr_Inos_Work:=[n_Xworkpos,n_Yworkpos,n_Zworkpos,n_workangleA,n_workangleB,n_workangleC];
+	
+	n_PAR:=[n_PAR_MODE,n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT,n_PAR_BASE];
+	
+	FOR index FROM 1 TO 6 DO
+		n_Inos_INPAR{index}:=n_PAR{index};
+	ENDFOR
+	
+	ClearRawBytes rb_packet;
+	RETURN TRUE;
+
+! Error handling
+ERROR
+
+	! Communication error handling is done in upper level, so no message boxes should pop-up here
+	!MsgBox_Clear;
+	!st_MsgBoxHeader:=["INOS Communication Error", "INOS Kommunikationsfehler", "???"];
+	
+	TEST ERRNO
+	
+	CASE en_ERR_1:
+		st_BFIBoxLine1:=["Error in BF_IOREAD", "Fehler in BF_IOREAD", "???"];
+		st_MsgBoxLine3:=["String received is not 108 characters long", "Empfangener String ist keine 108 Zeichen lang", "???"];
+	
+	CASE ERR_SOCK_TIMEOUT:
+		st_BFIBoxLine1:=["Error in BF_IOREAD", "Fehler in BF_IOREAD", "???"];
+		st_MsgBoxLine3:=["Failed to receive data from INOS station. Timeout exceeded.", "Konnte keine Daten von INOS-PC empfangen: Timeout abgelaufen", "???"];
+		
+	CASE ERR_SOCK_CLOSED:
+		st_BFIBoxLine1:=["Error in BF_IOREAD", "Fehler in BF_IOREAD", "???"];
+		st_MsgBoxLine3:=["Failed to receive data to INOS station. Broken connection", "Konnte keine Daten von INOS-PC empfangen: Verbindung unterbrochen", "???"];
+		
+	DEFAULT:
+		st_BFIBoxLine1:=["Error in BF_IOREAD", "Fehler in BF_IOREAD", "???"];
+		st_MsgBoxLine3:=["Unhandled exception in sending data to INOS Station.", "Unbehandelte Ausnahme beim Senden der Daten an INOS-PC", "???"];
+		
+	ENDTEST
+	
+	! Log error
+	st_LogMessage:="ERR -> " + st_MsgBoxLine3{n_Sp};
+	Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+	
+	!n_MsgBoxPLC_Error:=20805;
+	!MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+
+	n_Inos_Error_Code:=1;
+	RETURN FALSE;
+
+ENDFUNC	!(BF_IOREAD)
+
+
+LOCAL PROC BF_SETUP(num n_PAR_FUNC,num n_PAR_MODEL,num n_PAR_TYPE,num n_PAR_REPEAT,num n_PAR_BASE)
+!************************************************
+!*				BF_SETUP Routine				*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+!	n_PAR_FUNC		-> requested function
+!	n_PAR_MODEL		-> model number
+!	n_PAR_TYPE		-> process number
+!	n_PAR_REPEAT		-> not used
+!	n_PAR_BASE		-> training mode
+!************************************************
+
+	VAR bool b_Comm_OK;
+	
+	
+	TEST n_PAR_FUNC
+	
+	CASE 1:  ! path 1 - [1] training.
+			BF_SYSTEM_CALIBRATION n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_PAR_BASE;
+	
+	CASE 4:  ! path 1 - [4] training study. 
+			BF_SYSTEM_CALIBRATION n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_PAR_BASE;
+	
+	CASE 2,3: ! path  1 - [2] setup grip  OR  1- [3]  setup fit            
+	
+			b_Comm_OK:=BF_IOWRITE(1,n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,1,1);
+			IF b_Comm_OK THEN
+				b_Comm_OK:=BF_IOREAD(3);
+			ENDIF
+			
+			IF b_Comm_OK THEN
+				fr_MaxMove{n_PAR_TYPE}:=fr_Inos_TCP;
+			ELSE
+				RAISE en_ERR_1;
+			ENDIF
+	
+	CASE 6: ! path 1 - [6] reset car
+			b_Comm_OK:=BF_IOWRITE(1,n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,1,1);
+			IF b_Comm_OK THEN
+				b_Comm_OK:=BF_IOREAD(3);
+			ENDIF
+			
+			IF NOT b_Comm_OK THEN
+				RAISE en_ERR_1;
+			ENDIF
+			
+	CASE 7: ! path 1 - [7] gripper exchange
+			b_Comm_OK:=BF_IOWRITE(1,n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,1,1);
+			IF b_Comm_OK THEN
+				b_Comm_OK:=BF_IOREAD(3);
+			ENDIF
+			
+			IF NOT b_Comm_OK THEN
+				RAISE en_ERR_1;
+			ENDIF
+			
+	DEFAULT:
+			RAISE en_ERR_2;
+			
+	ENDTEST
+	
+! Error handling
+ERROR
+
+	TEST ERRNO
+	
+		CASE en_ERR_1:
+	
+		! Communication error. Don't interrupt the program, just log the error
+		n_Inos_Error_Code:=1;
+		
+		st_BFIBoxLine1:=["BF_SETUP Error", "BF_SETUP Fehler", "???"];
+		st_MsgBoxLine3:= ["Connection Error", "Kommunikationsfehler", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> " + st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+	CASE en_ERR_2:
+	
+		n_Inos_Error_Code:=5;
+		st_BFIBoxLine1:=["BF_SETUP Error", "BF_SETUP Fehler", "???"];
+		st_MsgBoxLine3{1}:="Invalid Combination of Parameters, Par[2]= "+ValToStr(n_PAR_FUNC);
+		st_MsgBoxLine3{2}:="Ungultig Kombination der Parameter, Par[2]= "+ValToStr(n_PAR_FUNC);
+		st_MsgBoxLine3{3}:="???";
+		
+		! Log error
+		st_LogMessage:="ERR -> " + st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+	ENDTEST
+    
+    RETURN;
+	
+ENDPROC	!(BF_SETUP)
+
+
+LOCAL PROC BF_CORRECTION(num n_PAR_FUNC,num n_PAR_MODEL,num n_PAR_TYPE,num n_PAR_REPEAT,num n_PAR_BASE)
+!************************************************
+!*				BF_CORRECTION Routine			*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+!	n_PAR_FUNC		-> requested function
+!	n_PAR_MODEL		-> model number
+!	n_PAR_TYPE		-> process number
+!	n_PAR_REPEAT		-> max number of correction retries
+!	n_PAR_BASE		-> not used
+!************************************************
+
+	VAR frame fr_MAX_MOVE;
+	
+	
+	! Correction request (meaningful only if car part is available - PLC_di_NoPart=0)
+	TEST n_PAR_FUNC
+	
+
+	CASE 1,2,3: ! path 2-[1] OR 2-[2] OR 2-[3] correction in case of positioning
+	
+		! No correction request if part is not in place
+		IF DInput(PLC_di_NoPart)=0 THEN
+			
+			! PLC decides if correction is based on INOS measurements or average
+			IF DInput(PLC_di_BF_Mean)=0 THEN
+		                fr_MAX_MOVE:=fr_MaxMove{n_PAR_TYPE};
+				BF_HPFIT fr_MAX_MOVE,n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT;
+			ELSE
+				! Average fitting movement 
+				BF_HPFIT_AVG n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE;
+			ENDIF
+			
+		ENDIF
+	
+			
+	CASE 9: !path 2-[9] request total Work offset (for the screwing robot)
+    
+		IF DInput(PLC_di_BF_Mean)=0 THEN
+			BF_CORR_WORK n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT;
+		ELSE
+			!Average screwing correction
+			BF_CORR_WORK_AVG n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT;
+		ENDIF	
+			
+	CASE 11: ! 2-[11] performing average fitting movement for testing 
+
+		IF b_HPFit THEN    
+			BF_HPFIT_AVG n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE;
+		ELSE
+			BF_START_WITH_AVG n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE;
+		ENDIF
+	
+	DEFAULT:
+		RAISE en_ERR_1;
+			
+	ENDTEST
+	
+
+! Error handling
+ERROR
+
+	MsgBox_Clear;
+	st_MsgBoxHeader:=["INOS Best-Fit Error", "INOS Best-Fit Fehler", "???"];
+	
+	TEST ERRNO
+	
+	CASE en_ERR_1:
+	
+		n_Inos_Error_Code:=5;
+		st_BFIBoxLine1:=["BF_CORRECTION Error", "BF_CORRECTION Fehler", "???"];
+		st_MsgBoxLine3{1}:="Invalid Combination of Parameters, Par[2]= "+ValToStr(n_PAR_FUNC);
+		st_MsgBoxLine3{2}:="Ungultig Kombination der Parameter, Par[2]= "+ValToStr(n_PAR_FUNC);
+		st_MsgBoxLine3{3}:="???";
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20818;
+		Set PLC_do_BF_Meas_Err;
+		
+		!The following message should appear until the error is fixed.
+		MsgBox \Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		Reset PLC_do_BF_Meas_Err;
+		
+	ENDTEST
+    
+    RETURN;
+	
+ENDPROC	!(BF_CORRECTION)
+
+
+LOCAL PROC BF_HPFIT_AVG(num n_PAR_FUNC,num n_PAR_MODEL,num n_PAR_TYPE)
+!************************************************
+!*				BF_HPFIT_AVG Routine				*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+!	fr_MAX_MOVE		-> maximum allowed robot movement (x,y,z,a,b,c)
+!	n_PAR_FUNC		-> requested function
+!	n_PAR_MODEL		-> model number
+!	n_PAR_TYPE		-> process number
+!************************************************
+
+	VAR robtarget rt_Initial_robT;
+	VAR frame fr_avg_displace;
+	VAR pose pose_avg_displace;
+	VAR bool b_Out_Of_Tol_Wrk;
+	VAR bool b_AllowRetry;
+	
+	! Read Current Robot Position of the tool (CurrentFrame)
+	rt_Initial_robT:= CRobT(\Tool:=t_inosTool \WObj:=wobj_inosWobj);
+	pose_InosBakTCP:=BF_RobTargetToPose(rt_Initial_robT);
+	pose_InosBakWork:=wobj_inosWobj.oframe;
+	
+	! Safety check for accumulative TCP and WORK overall corrections
+	fr_avg_displace:=fr_AverageWorkCorr{n_PAR_MODEL,n_PAR_TYPE};
+	
+	b_Out_Of_Tol_Wrk:=(ABS(fr_avg_displace.X)>50)OR(ABS(fr_avg_displace.Y)>50)OR(ABS(fr_avg_displace.Z)>50)OR(ABS(fr_avg_displace.A)>1)OR(ABS(fr_avg_displace.B)>1)OR(ABS(fr_avg_displace.C)>1);
+	
+	IF b_Out_Of_Tol_Wrk THEN 
+		RAISE en_ERR_1;
+	ENDIF
+	
+	pose_avg_displace:= BF_FrametoPose(fr_avg_displace);
+	! Update the wobj frame with the average correction
+	wobj_inosWobj.oframe := PoseMult(wobj_inosWobj.oframe, pose_avg_displace);
+	
+	! Move to initial robot position using the changes wobj frame
+	MOVEL rt_Initial_robT,vFitSpeed,fine,t_inosTool\WObj:=wobj_inosWobj;
+	WaitTime 0.25;
+	
+	! Log overall work object offset
+	IF b_EnableDebugLog THEN
+	
+		TEST n_Sp
+		CASE 1:
+			st_LogMessage:="MSG -> Average Total WOBJ - X:"+ValToStr(fr_avg_displace.X)+" Y:"+ValToStr(fr_avg_displace.Y)+" Z:"+ValToStr(fr_avg_displace.Z);
+			st_LogMessage:="MSG -> Average Total WOBJ - A:"+ValToStr(fr_avg_displace.A)+" B:"+ValToStr(fr_avg_displace.B)+" C:"+ValToStr(fr_avg_displace.C);
+		CASE 2:
+			st_LogMessage:="MSG -> Mittelwert Gesamt WOBJ - X:"+ValToStr(fr_avg_displace.X)+" Y:"+ValToStr(fr_avg_displace.Y)+" Z:"+ValToStr(fr_avg_displace.Z);
+			st_LogMessage:="MSG -> Mittelwert Gesamt WOBJ - A:"+ValToStr(fr_avg_displace.A)+" B:"+ValToStr(fr_avg_displace.B)+" C:"+ValToStr(fr_avg_displace.C);
+		DEFAULT:
+			st_LogMessage:="MSG -> ???";
+		ENDTEST
+		
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+	ENDIF
+
+
+! Error handling
+ERROR
+
+	MsgBox_Clear;
+	st_MsgBoxHeader:=["INOS Best-Fit Average Error", "INOS Best-Fit Mittelwert-Fehler", "???"];
+	st_BFIBoxLine1:=["BF_HPFIT_AVG Error", "BF_HPFIT_AVG Fehler", "???"];
+	
+	TEST ERRNO
+	
+	CASE en_ERR_1:
+	
+		n_Inos_Error_Code:=4;
+			
+		st_MsgBoxLine3:= ["Average correction outside the maximum Best-Fit thresholds", "Korrektur mit Mittelwert ausserhalb der Best-Fit Grenzwerte", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		Set PLC_do_BF_Meas_Err;
+		n_MsgBoxPLC_Error:=20823;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		Reset PLC_do_BF_Meas_Err;
+		
+	DEFAULT : 
+		n_Inos_Error_Code:=8;
+		
+		st_MsgBoxLine3{1}:="Unknown Error Code: "+ValToStr(ERRNO);
+		st_MsgBoxLine3{2}:="Unbekannter Fehler: "+ValToStr(ERRNO);
+		st_MsgBoxLine3{3}:="???";
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20809;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		Reset PLC_do_BF_Meas_Err;
+			
+	ENDTEST
+    
+    RETURN;
+
+ENDPROC	!(BF_HPFIT_AVG)
+
+
+LOCAL PROC BF_UPDATE_AVG(num n_PAR_MODEL, num n_PAR_TYPE)
+!************************************************
+!*				BF_UPDATE_AVG Routine				*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!	n_PAR_MODEL		-> model number
+!	n_PAR_TYPE		-> process number
+!************************************************	
+	
+	! Request Average Correction update from PC
+	VAR bool b_Comm_OK;
+	VAR bool b_AllowRetry:=FALSE;
+	
+	b_Comm_OK:=BF_IOWRITE(2,11,n_PAR_MODEL,n_PAR_TYPE,1,1);
+						
+	IF b_Comm_OK THEN   
+		b_Comm_OK:=BF_IOREAD(10);
+	ENDIF
+							
+	! Communication error checking
+	IF NOT b_Comm_OK THEN
+		RAISE en_ERR_1;
+	ENDIF
+							
+	IF n_Inos_INPAR{5}=9 THEN
+		RAISE en_ERR_2;							
+								
+	ELSE
+		! Current fitting step TCP correction
+		fr_AverageTCPCorr{n_PAR_MODEL,n_PAR_TYPE}:=fr_Inos_TCP;
+						
+		! Current fitting step WORK correction
+		fr_AverageWorkCorr{n_PAR_MODEL,n_PAR_TYPE}:=fr_Inos_Work;
+			
+	ENDIF !n_Inos_INPAR{5}=9
+	
+ERROR
+
+	MsgBox_Clear;
+	st_MsgBoxHeader:=["INOS Error", "INOS Fehler", "???"];
+	st_BFIBoxLine1:=["BF_UPDATE_AVG Error", "BF_UPDATE_AVG Fehler", "???"];
+	
+	TEST ERRNO
+	
+	CASE en_ERR_1:
+	
+		! Communication error
+		n_Inos_Error_Code:=1;
+		
+		st_MsgBoxLine3:= ["Connection Error", "Kommunikationsfehler", "???"];
+		st_MsgBoxLine4:= ["Waiting for PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat", "Warte auf SPS-Signal: PLC_di_BF_Abort or PLC_di_BF_Repeat", "???"];
+		st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+		st_MsgBoxbutton5:=["Abort", "Abbrechen", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> " + st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20805;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		! Retry when PLC_di_BF_Repeat signal is active
+		IF (DInput(PLC_di_BF_Repeat)=1  OR n_MsgBoxAnswer=1) THEN
+			b_AllowRetry:=TRUE;
+		ENDIF
+		
+		Reset PLC_do_BF_Meas_Err;
+	
+	CASE en_ERR_2: 
+		n_Inos_Error_Code:=8;
+		
+		st_MsgBoxLine3{1}:="Error in retrieving average data";
+		st_MsgBoxLine3{2}:="Fehler beim Abruf des Mittelwertes";
+		st_MsgBoxLine3{3}:="???";
+		st_MsgBoxLine4:=["Waiting for PLC signal: PLC_di_BF_Abort", "Warte auf SPS signal: PLC_di_BF_Abort", "???"];
+		st_MsgBoxbutton5:=["Abort", "Abort", "???"];
+
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		Set PLC_do_BF_Meas_Err;
+		n_MsgBoxPLC_Error:=20824;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		Reset PLC_do_BF_Meas_Err;
+	
+	DEFAULT:
+		n_Inos_Error_Code:=8;
+		
+		st_MsgBoxLine3{1}:="Unknown Error Code: "+ValToStr(ERRNO);
+		st_MsgBoxLine3{2}:="Unbekannter Fehler: "+ValToStr(ERRNO);
+		st_MsgBoxLine3{3}:="???";
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20809;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		Reset PLC_do_BF_Meas_Err;
+		
+	ENDTEST
+	
+	IF b_AllowRetry THEN
+		! In case of communication failure try to restore socket connection
+		IF (ERRNO=en_ERR_1) THEN
+			BF_IOEXIT;
+			b_connected:=BF_IOINIT(3, st_BestFit_IP, n_BestFit_PORT);
+		ENDIF
+		
+		IF b_connected THEN
+			! Reset error code
+			n_Inos_Error_Code:=0;
+			BF_UPDATE_AVG n_PAR_MODEL, n_PAR_TYPE;
+			RETURN;
+		ENDIF
+	ENDIF
+    
+    RETURN;
+	
+ENDPROC !BF_UPDATE_AVG
+
+
+LOCAL PROC BF_SHARE_CAMERAS (num n_PAR_FUNC,num n_PAR_MODEL,num n_PAR_TYPE,num n_PAR_REPEAT,num n_PAR_BASE)
+!************************************************
+!*				BF_SHARE_CAMERAS Routine		*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+!	n_PAR_FUNC		-> requested function
+!	n_PAR_MODEL		-> set number of shared cameras
+!	n_PAR_TYPE		-> Operation - Release or Allocate the cameras
+!	n_PAR_REPEAT	-> parameter 5
+!	n_PAR_BASE		-> parameter 6
+!************************************************
+
+	VAR bool b_Comm_OK;
+	
+	TEST n_PAR_FUNC
+	
+	CASE 2: !path 5-[2] Release or Allocate the shared cameras 
+		b_Comm_OK:=BF_IOWRITE(5,n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT,n_PAR_BASE);
+		IF b_Comm_OK THEN
+			b_Comm_OK:=BF_IOREAD(20);
+		ENDIF
+
+	ENDTEST
+	RETURN;
+	
+ENDPROC	!(BF_SHARE_CAMERAS)
+
+
+LOCAL PROC BF_START_WITH_AVG(num n_PAR_FUNC,num n_PAR_MODEL,num n_PAR_TYPE)
+!************************************************
+!*				BF_START_WITH_AVG Routine				*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!	n_PAR_FUNC		-> requested function
+!	n_PAR_MODEL		-> model number
+!	n_PAR_TYPE		-> process number
+!************************************************	
+	
+	! Request Average Correction update from PC
+	VAR bool b_Comm_OK;
+	VAR bool b_AllowRetry:=FALSE;
+	
+	! P5 = 2 to inform G-Guide that fitting will start from Average Position
+	b_Comm_OK:=BF_IOWRITE(2,11,n_PAR_MODEL,n_PAR_TYPE,2,1);
+						
+	IF b_Comm_OK THEN   
+		b_Comm_OK:=BF_IOREAD(10);
+	ENDIF
+							
+	! Communication error checking
+	IF NOT b_Comm_OK THEN
+		RAISE en_ERR_1;
+	ENDIF
+							
+	IF n_Inos_INPAR{5}=9 THEN
+		RAISE en_ERR_2;							
+								
+	ELSE
+		! Current fitting step TCP correction
+		fr_AverageTCPCorr{n_PAR_MODEL,n_PAR_TYPE}:=fr_Inos_TCP;
+						
+		! Current fitting step WORK correction
+		fr_AverageWorkCorr{n_PAR_MODEL,n_PAR_TYPE}:=fr_Inos_Work;
+		
+		BF_HPFIT_AVG n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE;
+			
+	ENDIF !n_Inos_INPAR{5}=9
+	
+ERROR
+
+	MsgBox_Clear;
+	st_MsgBoxHeader:=["INOS Error", "INOS Fehler", "???"];
+	st_BFIBoxLine1:=["BF_START_WITH_AVG Error", "BF_START_WITH_AVG Fehler", "???"];
+	
+	TEST ERRNO
+
+	CASE en_ERR_1:
+	
+		! Communication error
+		n_Inos_Error_Code:=1;
+		
+		st_MsgBoxLine3:= ["Connection Error", "Kommunikationsfehler", "???"];
+		st_MsgBoxLine4:= ["Waiting for PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat", "Warte auf SPS-Signal: PLC_di_BF_Abort or PLC_di_BF_Repeat", "???"];
+		st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+		st_MsgBoxbutton5:=["Abort", "Abbrechen", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> " + st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20805;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		! Retry when PLC_di_BF_Repeat signal is active
+		IF (DInput(PLC_di_BF_Repeat)=1  OR n_MsgBoxAnswer=1) THEN
+			b_AllowRetry:=TRUE;
+		ENDIF
+		
+		Reset PLC_do_BF_Meas_Err;
+	
+	CASE en_ERR_2: 
+		n_Inos_Error_Code:=8;
+		
+		st_MsgBoxLine3{1}:="Error in retrieving average data";
+		st_MsgBoxLine3{2}:="Fehler beim Abruf des Mittelwertes";
+		st_MsgBoxLine3{3}:="???";
+		st_MsgBoxLine4:=["Waiting for PLC signal: PLC_di_BF_Abort", "Warte auf SPS signal: PLC_di_BF_Abort", "???"];
+		st_MsgBoxbutton5:=["Abort", "Abort", "???"];
+
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		Set PLC_do_BF_Meas_Err;
+		n_MsgBoxPLC_Error:=20824;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		Reset PLC_do_BF_Meas_Err;
+	
+	DEFAULT:
+		n_Inos_Error_Code:=8;
+		
+		st_MsgBoxLine3{1}:="Unknown Error Code: "+ValToStr(ERRNO);
+		st_MsgBoxLine3{2}:="Unbekannter Fehler: "+ValToStr(ERRNO);
+		st_MsgBoxLine3{3}:="???";
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20809;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		Reset PLC_do_BF_Meas_Err;
+		
+	ENDTEST
+	
+	IF b_AllowRetry THEN
+		! In case of communication failure try to restore socket connection
+		IF (ERRNO=en_ERR_1) THEN
+			BF_IOEXIT;
+			b_connected:=BF_IOINIT(3, st_BestFit_IP, n_BestFit_PORT);
+		ENDIF
+		
+		IF b_connected THEN
+			! Reset error code
+			n_Inos_Error_Code:=0;
+			BF_START_WITH_AVG n_PAR_FUNC,n_PAR_MODEL, n_PAR_TYPE;
+			RETURN;
+		ENDIF
+	ENDIF
+	
+ENDPROC !BF_START_WITH_AVG
+
+
+LOCAL PROC BF_MEASURE (num n_PAR_FUNC,num n_PAR_MODEL,num n_PAR_TYPE,num n_PAR_REPEAT,num n_PAR_BASE)
+!************************************************
+!*				BF_MEASURE Routine				*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+!	n_PAR_FUNC		-> requested function
+!	n_PAR_MODEL		-> model number
+!	n_PAR_TYPE		-> process number
+!	n_PAR_REPEAT	-> parameter 5
+!	n_PAR_BASE		-> parameter 6
+!************************************************
+
+	VAR bool b_Comm_OK;
+	VAR bool b_AllowRetry:=FALSE;
+	
+	TEST n_PAR_FUNC
+	
+	CASE 2: !path 3-[2] measurement during positioning or fitting
+		b_Comm_OK:=BF_IOWRITE(3,n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT,n_PAR_BASE);
+		IF b_Comm_OK THEN
+			b_Comm_OK:=BF_IOREAD(10);
+		ENDIF
+		
+		IF NOT b_Comm_OK THEN
+			RAISE en_ERR_1;
+		ENDIF
+	
+	CASE 3: !path 3-[3] measurement during positioning or fitting
+		b_Comm_OK:=BF_IOWRITE (3,n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT,n_PAR_BASE);
+		IF b_Comm_OK THEN
+			b_Comm_OK:=BF_IOREAD(10);
+		ENDIF
+		
+		IF NOT b_Comm_OK THEN
+			RAISE en_ERR_1;
+		ENDIF
+		
+		IF n_Inos_INPAR{5}=6 THEN
+			RAISE en_ERR_2;
+		ENDIF
+	
+	CASE 1,4: !path 3-[1]or[4]measurement at reference frame
+		b_Comm_OK:=BF_IOWRITE(3,n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT,n_PAR_BASE);
+		IF b_Comm_OK THEN
+			b_Comm_OK:=BF_IOREAD(10);
+		ENDIF
+		
+		IF NOT b_Comm_OK THEN
+			RAISE en_ERR_1;
+		ENDIF
+			
+		IF n_PAR_FUNC=1 THEN
+		
+			MsgBox_Clear;
+			
+			IF n_Inos_INPAR{6}=0 THEN
+			
+				st_MsgBoxHeader:=["INOS Measure","INOS Messung","???"];
+				st_BFIBoxLine1:=["BF_MEASURE", "BF_MEASURE", "???"];
+				st_MsgBoxLine3:=["OK : No Variation of measurements. Sensors are not moved", "OK : Keine Veranderung an den Messungen. Sensoren werden nicht verschoben", "???"];
+				IF OpMode()<>OP_Auto THEN
+					st_MsgBoxbutton1:=["OK", "OK", "???"];
+				ENDIF
+				! Log message
+				IF b_EnableDebugLog THEN
+					st_LogMessage:="MSG -> "+st_MsgBoxLine3{n_Sp};
+					Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+				ENDIF
+				IF OpMode()<>OP_Auto THEN
+					MsgBox \Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" ";
+				ENDIF
+	
+			ELSEIF n_Inos_INPAR{6}=1 THEN
+	
+				st_MsgBoxHeader:=["INOS Measure","INOS Messung","???"];
+				st_BFIBoxLine1:=["BF_MEASURE", "BF_MEASURE", "???"];
+				st_MsgBoxLine3:=["OK : Small Variation of sensor measurements", "OK: Kleine Variation von Sensormessungen.", "???"];
+				IF OpMode()<>OP_Auto THEN
+					st_MsgBoxbutton1:=["OK", "OK", "???"];
+				ENDIF
+				! Log message
+				IF b_EnableDebugLog THEN
+					st_LogMessage:="MSG -> "+st_MsgBoxLine3{n_Sp};
+					Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+				ENDIF
+				
+				IF OpMode()<>OP_Auto THEN
+					MsgBox \Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" ";
+				ENDIF
+				
+			ELSE
+				RAISE en_ERR_3;
+				
+			ENDIF
+		ENDIF
+	
+	CASE 5,7: !Record nominal without axis path 3-[5]or[7]
+		b_Comm_OK:=BF_IOWRITE(3,n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT,n_PAR_BASE);
+		IF b_Comm_OK THEN
+			b_Comm_OK:=BF_IOREAD(10);
+		ENDIF
+		
+		IF NOT b_Comm_OK THEN
+			RAISE en_ERR_1;
+		ENDIF
+	
+	CASE 10: !path 3-[10] Control without deleting overall correction
+		b_Comm_OK:=BF_IOWRITE(3,n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT,n_PAR_BASE);
+		IF b_Comm_OK THEN
+			b_Comm_OK:=BF_IOREAD(10);
+		ENDIF
+		
+		IF NOT b_Comm_OK THEN
+			RAISE en_ERR_1;
+		ENDIF
+	
+	CASE 14,15,16: !path 3-[14|15|16] trigger database queries and update nominal values
+		b_Comm_OK:=BF_IOWRITE(3,n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT,n_PAR_BASE);
+		IF b_Comm_OK THEN
+			b_Comm_OK:=BF_IOREAD(10);
+		ENDIF
+		
+		IF NOT b_Comm_OK THEN
+			RAISE en_ERR_1;
+		ENDIF
+		
+			
+	DEFAULT:
+		RAISE en_ERR_4;
+			
+	ENDTEST
+
+	
+! Error handling	
+ERROR
+
+	MsgBox_Clear;
+	st_MsgBoxHeader:=["INOS Measure Error", "INOS Messung Fehler", "???"];
+	st_BFIBoxLine1:=["BF_MEASURE Error", "BF_MEASURE Fehler", "???"];
+	
+	TEST ERRNO
+	
+	CASE en_ERR_1:
+	
+		! Communication error
+		n_Inos_Error_Code:=1;
+		
+		st_MsgBoxLine3:= ["Connection Error", "Kommunikationsfehler", "???"];
+		st_MsgBoxLine4:= ["Waiting for PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat", "Warte auf SPS-Signal: PLC_di_BF_Abort or PLC_di_BF_Repeat", "???"];
+		st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+		st_MsgBoxbutton5:=["Abort", "Abbrechen", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> " + st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20825;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		! Retry when PLC_di_BF_Repeat signal is active
+		IF (DInput(PLC_di_BF_Repeat)=1  OR n_MsgBoxAnswer=1) THEN
+			b_AllowRetry:=TRUE;
+		ENDIF
+		
+		Reset PLC_do_BF_Meas_Err;
+	
+	CASE en_ERR_2:
+	
+		n_Inos_Error_Code:=6;
+
+		st_MsgBoxLine3:=["Control Measurement: Measurements failed or out of tolerance.", "Kontrolmessung: Messungen fehlgeschlagen oder ausserhalb des Grenzwertes", "???"];
+		st_MsgBoxLine4:=["Waiting for PLC signal: PLC_di_BF_Abort", "Warte auf SPS-Signal: PLC_di_BF_Abort", "???"];
+		st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+		st_MsgBoxbutton5:=["Abort", "Abbrechen", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> " + st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20825;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		! Retry when PLC_di_BF_Repeat signal is active
+		IF (DInput(PLC_di_BF_Repeat)=1  OR n_MsgBoxAnswer=1) THEN
+			b_AllowRetry:=TRUE;
+		ENDIF
+		
+		Reset PLC_do_BF_Meas_Err;
+		
+	CASE en_ERR_3:
+	
+		n_Inos_Error_Code:=6;
+
+		st_MsgBoxLine3:=["Sensor Variation too big! Adjust the sensor(s) and repeat the procedure!", "Sensor Variation zu gross! Stellen den Sensor ein und wiederholen", "???"];
+		st_MsgBoxLine4:=["Waiting for PLC signal: PLC_di_BF_Abort", "Warte auf SPS-Signal: PLC_di_BF_Abort", "???"];
+		st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+		st_MsgBoxbutton5:=["Abort", "Abbrechen", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		Set PLC_do_BF_Meas_Err;
+		n_MsgBoxPLC_Error:=20822;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		! Retry when PLC_di_BF_Repeat signal is active
+		IF (DInput(PLC_di_BF_Repeat)=1  OR n_MsgBoxAnswer=1) THEN
+			b_AllowRetry:=TRUE;
+		ENDIF
+		
+		Reset PLC_do_BF_Meas_Err;
+		
+	CASE en_ERR_4:
+
+		n_Inos_Error_Code:=5;
+
+		st_MsgBoxLine3{1}:="Invalid Combination of Parameters, Par[2]= "+ValToStr(n_PAR_FUNC);
+		st_MsgBoxLine3{2}:="Ungultig Kombination der Parameter, Par[2]= "+ValToStr(n_PAR_FUNC);
+		st_MsgBoxLine3{3}:="???";
+		st_MsgBoxbutton5:=["Abort", "Abbrechen", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20818;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		Reset PLC_do_BF_Meas_Err;
+		
+	ENDTEST
+	
+	IF b_AllowRetry THEN
+		! In case of communication failure try to restore socket connection
+		IF (ERRNO=en_ERR_1) THEN
+			BF_IOEXIT;
+			b_connected:=BF_IOINIT(3, st_BestFit_IP, n_BestFit_PORT);
+		ENDIF
+		
+		IF b_connected THEN
+			! Reset error code
+			n_Inos_Error_Code:=0;
+			BF_MEASURE n_PAR_FUNC, n_PAR_MODEL, n_PAR_TYPE, n_PAR_REPEAT, n_PAR_BASE;
+			RETURN;
+		ENDIF
+	ENDIF
+    
+    RETURN;
+	
+ENDPROC	!(BF_MEASURE)
+
+
+LOCAL PROC BF_HPFIT(frame fr_MAX_MOVE,num n_PAR_FUNC,num n_PAR_MODEL,num n_PAR_TYPE,num n_MAX_TRIES)
+!************************************************
+!*				BF_HPFIT Routine				*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+!	fr_MAX_MOVE		-> maximum allowed robot movement (x,y,z,a,b,c)
+!	n_PAR_FUNC		-> requested function
+!	n_PAR_MODEL		-> model number
+!	n_PAR_TYPE		-> process number
+!	n_MAX_TRIES		-> max number of correction retries
+!************************************************
+
+	VAR bool b_Finish;
+	VAR bool b_Out_Of_Tol_TCP;
+	VAR bool b_Out_Of_Tol_Wrk;
+	VAR bool b_Comm_OK;
+	VAR bool b_AllowRetry;
+	VAR num n_Inos_MaxLoop;
+	VAR num n_Tries;
+	VAR num n_CurrentStep;
+	
+	VAR pose pose_CurrTCPCorr;
+	VAR frame fr_currTCPCorr;
+	VAR pose pose_CurrWorCorr;
+	VAR frame fr_currWorkCorr;
+	VAR pose pose_OverallCorr;
+	VAR frame fr_overallCorr;
+	VAR pose pose_OvrlWorCorr;
+	VAR frame fr_ovrallBasCorr;
+
+	VAR robtarget rt_Initial_robT;
+	VAR pose pose_Current;
+	VAR robtarget rt_Current_robT;
+	VAR pose pose_Last;
+	VAR robtarget rt_Last_robT;
+	VAR pose pose_Last_hyst;
+	VAR robtarget rt_Last_robT_hyst;
+
+	
+	! Initialization of correction cycle
+	b_Finish:=FALSE;
+	b_Out_Of_Tol_TCP:=FALSE;
+	b_Out_Of_Tol_Wrk:=FALSE;
+	n_Tries:=0;
+	n_Inos_MaxLoop:=1;
+	
+	
+	WHILE ((NOT b_Finish) AND (n_Tries<n_MAX_TRIES)) DO    !In case of more than one try
+	
+		pose_OverallCorr:=[[0,0,0],[1,0,0,0]];
+		fr_overallCorr:=[0,0,0,0,0,0];
+		pose_OvrlWorCorr:=[[0,0,0],[1,0,0,0]];
+		fr_ovrallBasCorr:=[0,0,0,0,0,0];
+		n_CurrentStep:=0;
+		
+		! Reset error flag
+		n_Inos_Error_Code:=0;
+		
+		! Read Current Robot Position of the tool (CurrentFrame)
+		rt_Initial_robT:= CRobT(\Tool:=t_inosTool \WObj:=wobj_inosWobj);
+		pose_InosBakTCP:=BF_RobTargetToPose(rt_Initial_robT);
+		pose_InosBakWork:=wobj_inosWobj.oframe;
+		
+		WHILE (n_CurrentStep<=n_Inos_MaxLoop) AND (n_Inos_Error_Code=0) AND (NOT b_Finish ) DO 	 !For each correction step
+	
+			! Request Correction from PC
+			b_Comm_OK:=BF_IOWRITE(2,n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,n_MAX_TRIES,n_Tries);
+			IF b_Comm_OK THEN   
+				b_Comm_OK:=BF_IOREAD(10);
+			ENDIF
+		
+			! Break the correction loop in case of communication error
+			IF b_Comm_OK THEN
+			
+			! Maximum fitting steps (read from the PC)
+			n_Inos_MaxLoop:=n_Inos_INPAR{6};
+
+			!HPFit sends PAR5=5 in case of ExecuteSingleCorrection. To make it compatible with gGuide it is set to 2 (last step) 
+			IF b_HPFit AND (n_Inos_INPAR{5}=5) THEN
+				n_Inos_INPAR{5}:=2;
+			ENDIF
+							
+			TEST n_Inos_INPAR{5}
+			
+			CASE 0,1,2: 
+	
+				! Current fitting step TCP correction
+				fr_currTCPCorr:=fr_Inos_TCP;
+				pose_CurrTCPCorr:=BF_FrameToPose(fr_currTCPCorr);
+				
+				! Current fitting step WORK correction
+				fr_currWorkCorr:=fr_Inos_Work;
+				pose_CurrWorCorr:=BF_FrameToPose(fr_currWorkCorr);
+				
+				! Overall fitting TCP correction
+				pose_OverallCorr:=PoseMult(pose_OverallCorr, pose_CurrTCPCorr);
+				fr_overallCorr:=BF_PoseToFrame(pose_OverallCorr);
+				
+				! Overall fitting WORK correction
+				pose_OvrlWorCorr:=PoseMult(pose_OvrlWorCorr, pose_CurrWorCorr); 
+				fr_ovrallBasCorr:=BF_PoseToFrame(pose_OvrlWorCorr);
+				
+				! Safety check for accumulative TCP and WORK overall corrections
+				b_Out_Of_Tol_TCP:=(ABS(fr_overallCorr.X)>fr_MAX_MOVE.X)OR(ABS(fr_overallCorr.Y)>fr_MAX_MOVE.Y)OR(ABS(fr_overallCorr.Z)>fr_MAX_MOVE.Z)OR(ABS(fr_overallCorr.A)>fr_MAX_MOVE.A)OR(ABS(fr_overallCorr.B)>fr_MAX_MOVE.B)OR(ABS(fr_overallCorr.C)>fr_MAX_MOVE.C);
+				b_Out_Of_Tol_Wrk:=(ABS(fr_ovrallBasCorr.X)>100)OR(ABS(fr_ovrallBasCorr.Y)>100)OR(ABS(fr_ovrallBasCorr.Z)>100)OR(ABS(fr_ovrallBasCorr.A)>5)OR(ABS(fr_ovrallBasCorr.B)>5)OR(ABS(fr_ovrallBasCorr.C)>5);
+	
+				IF b_Out_Of_Tol_TCP OR b_Out_Of_Tol_Wrk THEN 
+					RAISE en_ERR_2;
+					
+				ELSE
+					TEST n_PAR_FUNC
+			
+					CASE 1:
+					
+						! Only modify the robot work
+						wobj_inosWobj.oframe:=PoseMult(wobj_inosWobj.oframe, pose_CurrWorCorr);
+					
+					CASE 2,3:
+					
+						! Current TCP coordinates
+						rt_Current_robT:= CRobT(\Tool:=t_inosTool \WObj:=wobj_inosWobj);
+						pose_Current:=BF_RobtargetToPose(rt_Current_robT);
+						
+						! New TCP pose = current pose * correction
+						pose_Last:=PoseMult(pose_Current, pose_CurrTCPCorr);
+						rt_Last_robT:=BF_PoseToRobtarget(pose_Last);
+						
+						! Hysterisis compensation
+						pose_Last_hyst:=PoseMult(pose_Last, pose_HystComp);
+						rt_Last_robT_hyst:=BF_PoseToRobtarget(pose_Last_hyst);
+						
+						ConfL\Off;
+						! Move to final position + (Z: -1mm) in TCP coordinates (for hysterisis compensation)
+						MOVEL rt_Last_robT_hyst, vFitSpeed, z0, t_inosTool\WObj:=wobj_inosWobj;
+						
+						! Move to final position
+						MOVEL rt_Last_robT, vFitSpeed, fine, t_inosTool\WObj:=wobj_inosWobj;
+						WaitTime\InPos, n_delay;
+						ConfL\On;
+								
+					DEFAULT:
+					
+						RAISE en_ERR_3;
+							
+					ENDTEST
+					
+					! Increase fitting step
+					INCR n_CurrentStep; 
+					
+					
+					! Check if this is the last fitting step (decided from the PC)
+					IF n_Inos_INPAR{5}=2 THEN
+					
+						b_Finish:=TRUE;
+						
+						! Update WORK frame, so that all subsequent movements follow the car displacement 
+						wobj_inosWobj.oframe:=PoseMult(wobj_inosWobj.oframe, pose_OvrlWorCorr);
+
+						! Log fitting success
+						IF b_EnableDebugLog THEN
+
+							TEST n_Sp
+							CASE 1:
+								st_LogMessage:="MSG -> Correction cycle succeeded in "+ValToStr(n_CurrentStep)+" steps";
+							CASE 2:
+								st_LogMessage:="MSG -> Korrektur nach "+ValToStr(n_CurrentStep)+" Schritten erfolgreich beendet";
+							DEFAULT:
+								st_LogMessage:="MSG -> ???";
+							ENDTEST
+
+							Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+
+							! Log overall TCP offset
+							st_LogMessage:="MSG -> Total TCP - X:"+ValToStr(fr_overallCorr.X)+" Y:"+ValToStr(fr_overallCorr.Y)+" Z:"+ValToStr(fr_overallCorr.Z);
+							Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+
+							st_LogMessage:="MSG -> Total TCP - A:"+ValToStr(fr_overallCorr.A)+" B:"+ValToStr(fr_overallCorr.B)+" C:"+ValToStr(fr_overallCorr.C);
+							Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+
+							! Log overall work object offset
+							st_LogMessage:="MSG -> Total WOBJ - X:"+ValToStr(fr_ovrallBasCorr.X)+" Y:"+ValToStr(fr_ovrallBasCorr.Y)+" Z:"+ValToStr(fr_ovrallBasCorr.Z);
+							Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+
+							st_LogMessage:="MSG -> Total WOBJ - A:"+ValToStr(fr_ovrallBasCorr.A)+" B:"+ValToStr(fr_ovrallBasCorr.B)+" C:"+ValToStr(fr_ovrallBasCorr.C);
+							Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+
+						ENDIF
+
+						IF b_Update_Average THEN
+							!Update Average data in the matrix
+							BF_UPDATE_AVG n_PAR_MODEL,n_PAR_TYPE;	
+							RETURN;
+						ENDIF	!b_Update_Average
+						
+					ENDIF	! n_Inos_INPAR{5}=2 OR n_Inos_INPAR{5}=5
+					
+				ENDIF	! b_Out_Of_Tol_TCP OR b_Out_Of_Tol_Wrk
+	
+			CASE 3:
+	
+				! Correction out of limits
+				RAISE en_ERR_4;
+				
+			CASE 5:
+
+				! Maximum number of steps reached
+				RAISE en_ERR_9;
+
+			CASE 6:		
+				! Correction calculation failed
+				RAISE en_ERR_5;
+				
+			CASE 7:
+				! Image processing failure
+				RAISE en_ERR_6;
+				
+			CASE 8:
+				! Collision detected
+				RAISE en_ERR_7;
+								
+			DEFAULT:
+			
+				RAISE en_ERR_8;
+					
+			ENDTEST
+    			
+            ELSE
+               	RAISE en_ERR_1;
+
+            ENDIF   !IF b_Comm_OK
+            
+		ENDWHILE
+		
+		! Check if maximum number of correction steps has been reached
+		IF (n_CurrentStep>n_Inos_MaxLoop AND (NOT b_Finish) AND (n_Inos_Error_Code=0)) THEN
+		
+			RAISE en_ERR_9;
+	
+		ENDIF
+		
+		! Endless number of retries
+		!INCR n_Tries;	
+				
+	ENDWHILE
+	
+
+! Error handling
+ERROR
+
+	b_AllowRetry:=FALSE;
+	MsgBox_Clear;
+	st_MsgBoxHeader:=["INOS Best-Fit Error", "INOS Best-Fit Fehler", "???"];
+	st_BFIBoxLine1:=["BF_HPFIT Error", "BF_HPFIT Fehler", "???"];
+	
+	TEST ERRNO
+	
+	CASE en_ERR_1:
+	
+		! Communication error. Fitting will not continue
+		n_Inos_Error_Code:=1;
+		
+		st_MsgBoxLine3:= ["Connection Error", "Kommunikationsfehler", "???"];
+		st_MsgBoxLine4:= ["Waiting for PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat or PLC_di_BF_Mean", "Warte auf SPS-Signal: PLC_di_BF_Abort or PLC_di_BF_Repeat or PLC_di_BF_Mean", "???"];
+		st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+		st_MsgBoxbutton5:=["Average", "Mittelwert", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20805;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		! Retry when PLC_di_BF_Repeat signal is active
+		IF (DInput(PLC_di_BF_Repeat)=1  OR n_MsgBoxAnswer=1) THEN
+			b_AllowRetry:=TRUE;
+		ENDIF
+		
+		Reset PLC_do_BF_Meas_Err;
+		
+	CASE en_ERR_2:
+	
+		n_Inos_Error_Code:=4;
+		
+		st_MsgBoxLine3:= ["Correction outside the maximum robot thresholds", "Korrektur ausserhalb des Roboters Grenzwertes", "???"];
+		st_MsgBoxLine4{1}:= "Waiting for PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat or PLC_di_BF_Mean";
+		st_MsgBoxLine4{2}:= "Warte auf PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat or PLC_di_BF_Mean";
+		st_MsgBoxLine4{3}:= "???";
+		st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+		st_MsgBoxbutton5:=["Average", "Mittelwert", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20804;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		! Retry when PLC_di_BF_Repeat signal is active
+		IF (DInput(PLC_di_BF_Repeat)=1  OR n_MsgBoxAnswer=1) THEN
+			b_AllowRetry:=TRUE;
+		ENDIF
+		
+		Reset PLC_do_BF_Meas_Err;
+		
+	CASE en_ERR_3:
+		n_Inos_Error_Code:=5;
+		
+		st_MsgBoxLine3{1}:="Invalid Combination of Parameters, Par[2]= "+ValToStr(n_PAR_FUNC);
+		st_MsgBoxLine3{2}:="Ungultig Kombination der Parameter, Par[2]= "+ValToStr(n_PAR_FUNC);
+		st_MsgBoxLine3{3}:="???";
+		st_MsgBoxLine4{1}:= "Waiting for PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat or PLC_di_BF_Mean";
+		st_MsgBoxLine4{2}:= "Warte auf SPS-Signal: PLC_di_BF_Abort oder PLC_di_BF_Repeat oder PLC_di_BF_Mean";
+		st_MsgBoxLine4{3}:= "???";
+		st_MsgBoxbutton5:=["Average", "Mittelwert", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20818;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		Reset PLC_do_BF_Meas_Err;
+		
+	CASE en_ERR_4:
+		n_Inos_Error_Code:=4;
+		
+		st_MsgBoxLine3:= ["Correction outside the maximum Best-Fit thresholds", "Korrektur ausserhalb des Best-Fit Grenzwertes", "???"];
+		st_MsgBoxLine4{1}:= "Waiting for PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat or PLC_di_BF_Mean";
+		st_MsgBoxLine4{2}:= "Warte auf SPS-Signal: PLC_di_BF_Abort oder PLC_di_BF_Repeat oder PLC_di_BF_Mean";
+		st_MsgBoxLine4{3}:= "???";
+		st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+		st_MsgBoxbutton5:=["Average", "Mittelwert", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20803;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		! Retry when PLC_di_BF_Repeat signal is active
+		IF (DInput(PLC_di_BF_Repeat)=1  OR n_MsgBoxAnswer=1) THEN
+			b_AllowRetry:=TRUE;
+		ENDIF
+		
+		Reset PLC_do_BF_Meas_Err;
+		
+	CASE en_ERR_5:
+		n_Inos_Error_Code:=2;
+		
+		st_MsgBoxLine3:= ["Error in the inverse transformation!", "Fehler bei inverser Transformation", "???"];
+		st_MsgBoxLine4{1}:= "Waiting for PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat or PLC_di_BF_Mean";
+		st_MsgBoxLine4{2}:= "Warte auf SPS-Signal: PLC_di_BF_Abort oder PLC_di_BF_Repeat oder PLC_di_BF_Mean";
+		st_MsgBoxLine4{3}:= "???";
+		st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+		st_MsgBoxbutton5:=["Average", "Mittelwert", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20802;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		! Retry when PLC_di_BF_Repeat signal is active
+		IF (DInput(PLC_di_BF_Repeat)=1  OR n_MsgBoxAnswer=1) THEN
+			b_AllowRetry:=TRUE;
+		ENDIF
+		
+		Reset PLC_do_BF_Meas_Err;
+		
+	CASE en_ERR_6:
+		n_Inos_Error_Code:=2;
+		
+		st_MsgBoxLine3:= ["Error in the Image Processing", "Fehler bei der Bildverarbeitung", "???"];
+		st_MsgBoxLine4{1}:= "Waiting for PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat or PLC_di_BF_Mean";
+		st_MsgBoxLine4{2}:= "Warte auf SPS-Signal: PLC_di_BF_Abort oder PLC_di_BF_Repeat oder PLC_di_BF_Mean";
+		st_MsgBoxLine4{3}:= "???";
+		st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+		st_MsgBoxbutton5:=["Average", "Mittelwert", "???"];		
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20802;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		! Retry when PLC_di_BF_Repeat signal is active
+		IF (DInput(PLC_di_BF_Repeat)=1  OR n_MsgBoxAnswer=1) THEN
+			b_AllowRetry:=TRUE;
+		ENDIF
+		
+		Reset PLC_do_BF_Meas_Err;
+		
+	CASE en_ERR_7:
+		n_Inos_error_Code:=7;
+		
+		st_MsgBoxLine3:= ["Collision detected", "Kollision entdeckt", "???"];
+		st_MsgBoxLine4{1}:= "Waiting for PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat or PLC_di_BF_Mean";
+		st_MsgBoxLine4{2}:= "Warte auf SPS-Signal: PLC_di_BF_Abort oder PLC_di_BF_Repeat oder PLC_di_BF_Mean";
+		st_MsgBoxLine4{3}:= "???";
+		st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+		st_MsgBoxbutton5:=["Average", "Mittelwert", "???"];	
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20819;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		! Retry when PLC_di_BF_Repeat signal is active
+		IF (DInput(PLC_di_BF_Repeat)=1  OR n_MsgBoxAnswer=1) THEN
+			b_AllowRetry:=TRUE;
+		ENDIF
+		
+		Reset PLC_do_BF_Meas_Err;
+		
+	CASE en_ERR_8:
+		n_Inos_Error_Code:=5;
+		
+		st_MsgBoxLine3:= ["Received PAR 5 has wrong value!", "Empfangener PAR 5 hat falschen Wert", "???"];
+		st_MsgBoxLine4{1}:= "Waiting for PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat or PLC_di_BF_Mean";
+		st_MsgBoxLine4{2}:= "Warte auf SPS-Signal: PLC_di_BF_Abort oder PLC_di_BF_Repeat oder PLC_di_BF_Mean";
+		st_MsgBoxLine4{3}:= "???";
+		st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+		st_MsgBoxbutton5:=["Average", "Mittelwert", "???"];			
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20820;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		! Retry when PLC_di_BF_Repeat signal is active
+		IF (DInput(PLC_di_BF_Repeat)=1  OR n_MsgBoxAnswer=1) THEN
+			b_AllowRetry:=TRUE;
+		ENDIF
+		
+		Reset PLC_do_BF_Meas_Err;
+		
+	CASE en_ERR_9:
+		n_Inos_Error_Code:=3;
+		
+		st_MsgBoxLine3:=  ["Process interrupted because of many control steps!", "Prozess gestoppt wegen zu vieler Kontrollschritte!", "???"];
+		st_MsgBoxLine4{1}:= "Waiting for PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat or PLC_di_BF_Mean";
+		st_MsgBoxLine4{2}:= "Warte auf SPS-Signal: PLC_di_BF_Abort oder PLC_di_BF_Repeat oder PLC_di_BF_Mean";
+		st_MsgBoxLine4{3}:= "???";
+		st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+		st_MsgBoxbutton5:=["Average", "Mittelwert", "???"];	
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20821;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+
+		! Retry when PLC_di_BF_Repeat signal is active
+		IF (DInput(PLC_di_BF_Repeat)=1  OR n_MsgBoxAnswer=1) THEN
+			b_AllowRetry:=TRUE;
+		ENDIF
+		
+		Reset PLC_do_BF_Meas_Err;
+
+	DEFAULT : 
+		n_Inos_Error_Code:=8;
+		
+		st_MsgBoxLine3{1}:="Unknown Error Code: "+ValToStr(ERRNO);
+		st_MsgBoxLine3{2}:="Unbekannter Fehler: "+ValToStr(ERRNO);
+		st_MsgBoxLine3{3}:="???";
+		st_MsgBoxLine4{1}:= "Waiting for PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat or PLC_di_BF_Mean";
+		st_MsgBoxLine4{2}:= "Warte auf SPS-Signal: PLC_di_BF_Abort oder PLC_di_BF_Repeat oder PLC_di_BF_Mean";
+		st_MsgBoxLine4{3}:= "???";
+		st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+		st_MsgBoxbutton5:=["Average", "Mittelwert", "???"];	
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20809;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+			
+		! Retry when PLC_di_BF_Repeat signal is active
+		IF (DInput(PLC_di_BF_Repeat)=1  OR n_MsgBoxAnswer=1) THEN
+			b_AllowRetry:=TRUE;
+		ENDIF
+		
+		Reset PLC_do_BF_Meas_Err;
+		
+	ENDTEST
+	
+	! In case of error move the robot to the initial position
+	MOVEL rt_Initial_robT,vFitSpeed,fine,t_inosTool\WObj:=wobj_inosWobj;
+	WaitTime 0.25;
+	
+	IF b_AllowRetry THEN
+		st_LogMessage:="MSG -> RETRY";
+	ELSE
+		st_LogMessage:="MSG -> AVERAGE";
+	ENDIF
+		
+	! Log user input
+	Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+	
+	IF b_AllowRetry THEN
+		! In case of communication failure try to restore socket connection
+		IF (ERRNO=en_ERR_1) THEN
+			BF_IOEXIT;
+			b_connected:=BF_IOINIT(3, st_BestFit_IP, n_BestFit_PORT);
+		ENDIF
+	
+		! Retry correction until max tries has been reached (defined by the 5th INOS process parameter)
+		IF b_connected THEN
+			TRYNEXT;
+		ENDIF
+	ELSE
+		! Average fitting movement 
+		BF_HPFIT_AVG n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE;
+		RETURN;
+	ENDIF
+    
+    RETURN;
+
+ENDPROC	!(BF_HPFIT)
+
+
+LOCAL PROC BF_CORR_WORK(num n_PAR_MODEL, num n_PAR_TYPE, num n_PAR_REPEAT)
+!************************************************
+!*				BF_CORR_WORK Routine				*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+!	n_PAR_MODEL		-> model number
+!	n_PAR_TYPE		-> process number
+!   n_PAR_Repeat    -> parameter 5
+!************************************************
+
+	VAR bool b_Comm_OK;
+	VAR bool b_OutOfRangeWork;
+	VAR pose pose_CurrWrkCorr;
+	VAR bool b_AllowAverageScr;
+	VAR bool b_AllowRetry;
+	
+	b_Comm_OK:=BF_IOWRITE(2,9,n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT,1);
+		
+	IF b_Comm_OK THEN
+		b_Comm_OK:=BF_IOREAD(3);
+	ENDIF
+		
+	IF NOT b_Comm_OK THEN
+		RAISE en_ERR_1;
+	ENDIF
+		
+	b_OutOfRangeWork:=(ABS(fr_Inos_Work.X)>50) OR (ABS(fr_Inos_Work.Y)>50) OR (ABS(fr_Inos_Work.Z)>50) OR (ABS(fr_Inos_Work.A)>2) OR (ABS(fr_Inos_Work.B)>2) OR (ABS(fr_Inos_Work.C)>2);
+		
+	IF b_OutOfRangeWork THEN
+		RAISE en_ERR_2;
+	ENDIF
+	
+	pose_CurrWrkCorr:=BF_FrameToPose(fr_Inos_Work);
+	wobj_inosWobj.oframe:=PoseMult(wobj_inosWobj.oframe, pose_CurrWrkCorr);
+
+	IF b_Update_Average THEN
+		!Update Average data in the matrix
+		BF_UPDATE_AVG n_PAR_MODEL,n_PAR_TYPE;
+						
+	ENDIF !b_Update_Average
+	
+! Error handling
+ERROR
+	b_AllowRetry:=FALSE;
+	MsgBox_Clear;
+	st_MsgBoxHeader:=["INOS Screwing Robot Error", "INOS Verschrauben Roboter Fehler", "???"];
+	st_BFIBoxLine1:=["BF_CORR_WORK Error", "BF_CORR_WORK Fehler", "???"];
+	
+	TEST ERRNO
+	
+	CASE en_ERR_1:
+	
+		! Communication error
+		n_Inos_Error_Code:=1;
+		
+		st_MsgBoxLine3:= ["Connection Error", "Kommunikationsfehler", "???"];
+		st_MsgBoxLine4:= ["Waiting for PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat or PLC_di_BF_Mean", "Warte auf SPS-Signal: PLC_di_BF_Abort or PLC_di_BF_Repeat or PLC_di_BF_Mean", "???"];
+		st_MsgBoxbutton1:=["Retry", "Wiederholen", "???"];
+		st_MsgBoxbutton5:=["Average", "Mittelwert", "???"];	
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20805;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		! Retry when PLC_di_BF_Repeat signal is active
+		IF (DInput(PLC_di_BF_Repeat)=1 OR n_MsgBoxAnswer=1) THEN
+			b_AllowRetry:=TRUE;
+		ENDIF
+		
+		Reset PLC_do_BF_Meas_Err;
+		
+	CASE en_ERR_2:
+		n_Inos_Error_Code:=4;
+		
+		st_BFIBoxLine1:=["BF_CORR_WORK Error", "BF_CORR_WORK Fehler", "???"];
+		st_MsgBoxLine3:=["Screwing robot correction out of maximum thresholds-Use average correction", "Korrekturwert fuer Schraubroboter liegt ausserhalb des Grenzwertes", "???"];
+		st_MsgBoxLine4:= ["Waiting for PLC signal: PLC_di_BF_Abort or PLC_di_BF_Repeat or PLC_di_BF_Mean", "Warte auf SPS-Signal: PLC_di_BF_Abort oder PLC_di_BF_Repeat oder PLC_di_BF_Mean", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+			
+		n_MsgBoxPLC_Error:=20804;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		IF (DInput(PLC_di_BF_Mean)=1) THEN
+			b_AllowRetry:= TRUE;
+		ENDIF
+	
+		Reset PLC_do_BF_Meas_Err;
+	
+	ENDTEST
+	
+	IF b_AllowRetry THEN
+		! In case of communication failure try to restore socket connection
+		IF (ERRNO=en_ERR_1) THEN
+			BF_IOEXIT;
+			b_connected:=BF_IOINIT(3, st_BestFit_IP, n_BestFit_PORT);
+		ENDIF
+		
+		IF b_connected THEN
+			! Reset error code
+			n_Inos_Error_Code:=0;
+			BF_CORR_WORK n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT;
+			RETURN;
+		ENDIF
+		
+	ELSE
+		BF_CORR_WORK_AVG n_PAR_MODEL,n_PAR_TYPE,n_PAR_REPEAT;
+		RETURN;
+
+	ENDIF
+
+    RETURN;
+
+ENDPROC	!(BF_CORR_WORK)
+
+
+LOCAL PROC BF_CORR_WORK_AVG(num n_PAR_MODEL, num n_PAR_TYPE, num n_PAR_REPEAT)
+!************************************************
+!*				BF_CORR_WORK_AVG Routine				*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+!	n_PAR_MODEL		-> model number
+!	n_PAR_TYPE		-> process number
+!   n_PAR_Repeat    -> parameter 5
+!************************************************
+
+	VAR bool b_OutOfRangeWork;
+	VAR pose pose_CurrWrkCorr;
+	VAR bool b_AllowRetry;
+	
+	b_OutOfRangeWork:=(ABS(fr_AverageWorkCorr{n_PAR_MODEL,n_PAR_TYPE}.X)>50) OR (ABS(fr_AverageWorkCorr{n_PAR_MODEL,n_PAR_TYPE}.Y)>50) OR (ABS(fr_AverageWorkCorr{n_PAR_MODEL,n_PAR_TYPE}.Z)>50) OR (ABS(fr_AverageWorkCorr{n_PAR_MODEL,n_PAR_TYPE}.A)>2) OR (ABS(fr_AverageWorkCorr{n_PAR_MODEL,n_PAR_TYPE}.B)>2) OR (ABS(fr_AverageWorkCorr{n_PAR_MODEL,n_PAR_TYPE}.C)>2);
+		
+	IF b_OutOfRangeWork THEN
+		RAISE en_ERR_1;
+	ELSE
+		pose_CurrWrkCorr:=BF_FrameToPose(fr_AverageWorkCorr{n_PAR_MODEL,n_PAR_TYPE});
+		wobj_inosWobj.oframe:=PoseMult(wobj_inosWobj.oframe, pose_CurrWrkCorr);
+	ENDIF !b_OutOfRangeWork
+	
+! Error handling
+ERROR
+
+	MsgBox_Clear;
+	st_MsgBoxHeader:=["INOS Screwing Robot Error", "INOS Schraubroboter-Fehler", "???"];
+	st_BFIBoxLine1:=["BF_CORR_WORK Error", "BF_CORR_WORK Fehler", "???"];
+	
+	TEST ERRNO
+	
+	CASE en_ERR_1:
+
+		n_Inos_Error_Code:=4;
+		
+		st_BFIBoxLine1:=["BF_CORR_WORK_AVG Error", "BF_CORR_WORK_AVG Fehler", "???"];
+		st_MsgBoxLine3:=["Screwing robot average correction out of maximum thresholds", "Mittelwert des Schraubroboters liegt ausserhalb des Grenzwertes", "???"];
+		st_MsgBoxLine4:= ["Waiting for PLC signal: PLC_di_BF_Abort", "Warte auf SPS-Signal: PLC_di_BF_Abort", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+			
+		n_MsgBoxPLC_Error:=20804;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		Reset PLC_do_BF_Meas_Err;
+		
+	DEFAULT : 
+		n_Inos_Error_Code:=8;
+		
+		st_MsgBoxLine3{1}:="Unknown Error Code: "+ValToStr(ERRNO);
+		st_MsgBoxLine3{2}:="Unbekannter Fehler: "+ValToStr(ERRNO);
+		st_MsgBoxLine3{3}:="???";
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		n_MsgBoxPLC_Error:=20809;
+		Set PLC_do_BF_Meas_Err;
+		MsgBox \diBreakSignal:=PLC_di_BF_Abort\Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" "\ErrorToPLC;
+		
+		Reset PLC_do_BF_Meas_Err;		
+	ENDTEST
+    
+    RETURN;
+
+ENDPROC	!(BF_CORR_WORK_AVG)
+
+
+LOCAL PROC BF_SYSTEM_CALIBRATION(num n_PAR_FUNC,num n_PAR_MODEL,num n_PAR_TYPE,num n_PAR_BASE)
+!************************************************
+!*				BF_SYSTEM_CALIBRATION Routine				*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+!	n_PAR_FUNC		-> requested function
+!	n_PAR_MODEL		-> model number
+!	n_PAR_TYPE		-> process number
+!	n_PAR_BASE		-> training mode number
+!************************************************
+
+	VAR num n_N;                      !number of steps
+	VAR num n_iDOF:=0 ;                            
+	VAR num n_iStep:=0;                            
+	VAR num n_StepNr;
+	VAR frame fr_StepFrame;
+	VAR frame fr_StartFrame;
+	VAR robtarget rt_StartRob;
+	VAR bool b_Comm_OK;
+	VAR bool b_Continue;
+	
+	
+	! Request the robot movement thresholds from the PC (movement envelope per DOF)
+	b_Comm_OK:=BF_IOWRITE(1,n_PAR_FUNC,n_PAR_MODEL,n_PAR_TYPE,1,n_PAR_BASE);
+	IF b_Comm_OK THEN
+		b_Comm_OK:=BF_IOREAD(3);
+	ENDIF
+	
+	IF NOT b_Comm_OK THEN
+		RAISE en_ERR_1;
+	ENDIF
+			
+	n_N:=Round((n_Inos_INPAR{5}-1) DIV 2\Dec:=0);
+	fr_StepFrame.X:=(fr_Inos_TCP.X-fr_Inos_Work.X)/(n_Inos_INPAR{5}-1);
+	fr_StepFrame.Y:=(fr_Inos_TCP.Y-fr_Inos_Work.Y)/(n_Inos_INPAR{5}-1);
+	fr_StepFrame.Z:=(fr_Inos_TCP.Z-fr_Inos_Work.Z)/(n_Inos_INPAR{5}-1);
+	fr_StepFrame.A:=(fr_Inos_TCP.A-fr_Inos_Work.A)/(n_Inos_INPAR{5}-1);
+	fr_StepFrame.B:=(fr_Inos_TCP.B-fr_Inos_Work.B)/(n_Inos_INPAR{5}-1);
+	fr_StepFrame.C:=(fr_Inos_TCP.C-fr_Inos_Work.C)/(n_Inos_INPAR{5}-1);
+	
+	! Keep initial robot position
+	rt_StartRob:= CRobT(\Tool:=t_inosTool \WObj:=wobj_inosWobj);  			
+	fr_StartFrame:=BF_RobTargetToFrame(rt_StartRob);
+	n_StepNr:=0;
+	
+	FOR n_iDOF from 1 to 6 DO		!For all DOFs (X,Y,Z,A,B,C)
+	
+		FOR n_iStep from -n_N to n_N DO		!For all steps / DOF
+	
+			! Move robot to intermediate position
+			BF_STEPPOS n_iDOF,n_iStep,fr_StepFrame,fr_StartFrame ;
+			
+			!Trigger a measurement on the PC and wait for an answer
+			b_Comm_OK:=BF_IOWRITE(1,1,n_PAR_MODEL,n_PAR_TYPE,2,n_StepNr);
+			IF b_Comm_OK THEN
+				b_Comm_OK:=BF_IOREAD(10);
+			ENDIF
+			
+			IF b_Comm_OK THEN
+				IF n_Inos_INPAR{6}=0 THEN
+					RAISE en_ERR_2;
+				ENDIF
+			ELSE
+				RAISE en_ERR_3;
+			ENDIF
+			
+			!Increase robot position step
+			INCR n_StepNr;
+			
+		ENDFOR
+	
+		! Move robot to starting position
+		MOVEL rt_StartRob,vTrainSpeed,fine,t_inosTool\WObj:=wobj_inosWobj;
+	
+	ENDFOR
+		
+	IF n_Inos_INPAR{6}=0   THEN 
+	
+		RAISE en_ERR_4;
+		
+	ELSE
+	
+		MsgBox_Clear;
+		
+		IF n_PAR_FUNC=1 THEN
+		
+			st_MsgBoxHeader:=["INOS System Calibration", "INOS System Setup", "???"];
+			st_BFIBoxLine1:=["BF_SYSTEM_CALIBRATION", "BF_SYSTEM_CALIBRATION", "???"];
+			st_MsgBoxLine3:=["System Calibration Finished Succesfully. Update Sensitivity Matrix?", "System Kalibrierung erfolgreich beendet. Sensitivity Matrix aktualisieren?", "???"];
+			st_MsgBoxbutton1:=["Yes", "Ja", "???"];
+			st_MsgBoxbutton5:=["No", "Nein", "???"];
+			
+			! Log training success
+			IF b_EnableDebugLog THEN
+				st_LogMessage:="MSG -> "+st_MsgBoxLine3{n_Sp};
+				Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+			ENDIF
+				
+			MsgBox \Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" ";
+	
+			TEST n_Sp
+			CASE 1:
+				st_LogMessage:="MSG -> Sensitivity Matrix NOT Updated";
+			CASE 2:
+				st_LogMessage:="MSG -> Sensitivitymatrix NICHT aktualisiert";
+			DEFAULT:
+				st_LogMessage:="MSG -> ???";
+			ENDTEST
+			
+			! Yes/No button is pressed by the user?
+			IF n_MsgBoxAnswer=1 THEN
+			
+				b_Comm_OK:=BF_IOWRITE(1,1,n_PAR_MODEL,n_PAR_TYPE,3,0);
+				IF b_Comm_OK THEN
+					b_Comm_OK:=BF_IOREAD(3);
+				ENDIF
+				
+				IF b_Comm_OK THEN
+					TEST n_Sp
+					CASE 1:
+						st_LogMessage:="MSG -> Sensitivity Matrix Updated";
+					CASE 2:
+						st_LogMessage:="MSG -> Sensitivity Matrix aktualisiert";
+					DEFAULT:
+						st_LogMessage:="MSG -> ???";
+					ENDTEST
+				ENDIF
+				
+			ENDIF
+			
+			! Log user input
+			IF b_EnableDebugLog THEN
+				Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+			ENDIF
+			
+		ELSE
+		
+			st_MsgBoxHeader:=["INOS System Calibration", "INOS System Kalibrierung","???"];
+			st_BFIBoxLine1:=["BF_SYSTEM_CALIBRATION", "BF_SYSTEM_CALIBRATION", "???"];
+			st_MsgBoxLine3:=["System Calibration Study Finished. Not committing Data!", "System Kalibrierung Study beendet. Daten wurden nicht verandert!", "???"];
+			st_MsgBoxbutton1:=["OK", "OK", "???"];
+			
+			! Log training study success
+			IF b_EnableDebugLog THEN
+				st_LogMessage:="MSG -> "+st_MsgBoxLine3{n_Sp};
+				Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+			ENDIF
+	
+			MsgBox \Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" ";
+	
+		ENDIF	! IF n_PAR_FUNC=1
+		
+	ENDIF	! IF n_Inos_INPAR{6}=0
+
+
+! Error handling
+ERROR
+
+	b_Continue:=FALSE;
+	MsgBox_Clear;
+	st_MsgBoxHeader:=["INOS System Calibration Error", "INOS System Kalibrierung Fehler", "???"];
+	st_BFIBoxLine1:=["BF_SYSTEM_CALIBRATION Error", "BF_SYSTEM_CALIBRATION Fehler", "???"];
+	
+	TEST ERRNO
+	
+	CASE en_ERR_1:
+	
+		! Communication error
+		n_Inos_Error_Code:=1;
+		
+		st_MsgBoxLine3:= ["Connection Error", "Kommunikationsfehler", "???"];
+		st_MsgBoxLine4:= ["Waiting for PLC signal: PLC_di_BF_Abort", "Warte auf SPS-Signal: PLC_di_BF_Abort", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> " + st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		! Don't need PLC interaction for training
+		MsgBox \Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" ";
+	
+	CASE en_ERR_2:
+		st_MsgBoxLine3{1}:="Measurement failed at step: "+ValToStr(n_iStep);
+		st_MsgBoxLine3{2}:="Messung fehlgeschlagen im Schritt: "+ValToStr(n_iStep);
+		st_MsgBoxLine3{3}:="???";
+		st_MsgBoxbutton1:=["Continue", "Fortsetzen", "???"];
+		st_MsgBoxbutton5:=["Cancel", "Abbruch", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		MsgBox \Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" ";
+		
+		! Retry/Calcel button is pressed by the user?
+		IF n_MsgBoxAnswer=1 THEN
+			b_Continue:=TRUE;
+		ENDIF
+
+	CASE en_ERR_3:
+		st_MsgBoxLine3{1}:="Communication error at step: "+ValToStr(n_iStep)+". Training will not continue";
+		st_MsgBoxLine3{2}:="Kommunikationsfehler im Schritt: "+ValToStr(n_iStep)+". Training wird nicht fortgesetzt";
+		st_MsgBoxLine3{3}:="???";
+		st_MsgBoxbutton1:=["Continue", "Fortsetzen", "???"];
+		st_MsgBoxbutton5:=["Cancel", "Abbruch", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		MsgBox \Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" ";
+		
+		! Retry/Calcel button is pressed by the user?
+		IF n_MsgBoxAnswer=1 THEN
+			b_Continue:=TRUE;
+		ENDIF
+	
+	CASE en_ERR_4:
+		st_MsgBoxLine3:=["Error During Training Procedure. Please Repeat!", "Fehler im Trainingsprozess. Bitte wiederholen!", "???"];
+		st_MsgBoxbutton1:=["OK", "OK", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		MsgBox \Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" ";
+		
+	DEFAULT : 
+		st_MsgBoxLine3{1}:="Unknown Error Code: "+ValToStr(ERRNO);
+		st_MsgBoxLine3{2}:="Unbekannter Fehler: "+ValToStr(ERRNO);
+		st_MsgBoxLine3{3}:="???";
+		st_MsgBoxbutton1:=["OK", "OK", "???"];
+		
+		! Log error
+		st_LogMessage:="ERR -> "+st_MsgBoxLine3{n_Sp};
+		Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+		
+		MsgBox \Line1:=st_BFIBoxLine1{n_Sp}\Line2:=" ";
+	
+	ENDTEST
+	
+	IF b_Continue THEN
+		st_LogMessage:="MSG -> CONTINUE";
+	ELSE
+		st_LogMessage:="MSG -> ABORT";
+	ENDIF
+		
+	! Log user input
+	Log_Message "BFIT", st_LogMessage,\Timeout:=1;
+	
+	IF b_Continue THEN
+		TRYNEXT;
+	ENDIF
+    
+    RETURN;
+	
+ENDPROC	!(BF_SYSTEM_CALIBRATION)
+
+
+LOCAL PROC BF_STEPPOS(num n_IDOF,num n_ISTEP,frame fr_STEPFRAME,frame fr_STARTPOS)
+!************************************************
+!*				BF_STEPPOS Routine				*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+!	n_IDOF			-> degree of freedom for robot movement (1-6)
+!	n_ISTEP			-> robot movement step number
+!	fr_STEPFRAME	-> robot movement step frame
+!	fr_STARTPOS		-> robot starting position
+!************************************************
+
+	VAR num n_delta;
+	VAR frame fr_stepPos;
+	VAR pose pose_startPose;
+	VAR pose pose_stepPose;
+	VAR pose pose_targetPose;
+	VAR robtarget rt_targetRob;
+	
+	n_delta:=0;
+	fr_stepPos:=[0,0,0,0,0,0];
+		
+	TEST n_IDOF
+	
+	CASE 1:
+		fr_stepPos.X:=fr_STEPFRAME.X*n_ISTEP;
+		n_delta:=fr_STEPFRAME.X;
+	CASE 2:
+		fr_stepPos.Y:=fr_STEPFRAME.Y*n_ISTEP;
+		n_delta:=fr_STEPFRAME.Y;
+	CASE 3:
+		fr_stepPos.Z:=fr_STEPFRAME.Z*n_ISTEP;
+		n_delta:=fr_STEPFRAME.Z;
+	CASE 4:
+		fr_stepPos.A:=fr_STEPFRAME.A*n_ISTEP;
+		n_delta:=fr_STEPFRAME.A;
+	CASE 5:
+		fr_stepPos.B:=fr_STEPFRAME.B*n_ISTEP;
+		n_delta:=fr_STEPFRAME.B;
+	CASE 6:
+		fr_stepPos.C:=fr_STEPFRAME.C*n_ISTEP;
+		n_delta:=fr_STEPFRAME.C;
+	
+	ENDTEST
+	
+	IF n_DELTA>0.001 THEN
+		pose_startPose:=BF_FrameToPose(fr_STARTPOS);
+		pose_stepPose:=BF_FrameToPose(fr_stepPos);
+		pose_targetPose:=PoseMult(pose_startPose, pose_stepPose);
+		rt_targetRob:=BF_PoseToRobTarget(pose_targetPose);
+	
+		ConfL\Off;
+		MOVEL rt_targetRob,vTrainSpeed,fine,t_inosTool\WObj:=wobj_inosWobj;
+		WaitTime 1.0;
+		ConfL\On;
+	ENDIF
+		
+ENDPROC	!(BF_STEPPOS)
+
+
+LOCAL FUNC robtarget BF_FrameToRobTarget(frame fr_coords)
+!************************************************
+!*			BF_FrameToRobTarget Routine			*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+! Transform frame (X,Y,Z,A,B,C) to RobTarget
+!************************************************
+
+	VAR robtarget rt_returnValue;
+	
+	rt_returnValue.trans.x:=fr_coords.X;
+	rt_returnValue.trans.y:=fr_coords.Y;               
+	rt_returnValue.trans.z:=fr_coords.Z;
+	rt_returnValue.rot:=OrientZYX(fr_coords.A,fr_coords.B,fr_coords.C);
+	rt_returnValue.extax:=[9E9,9E9,9E9,9E9,9E9,9E9];
+	
+	return rt_returnValue;
+	
+ENDFUNC	!(BF_FrameToRobTarget)
+
+
+LOCAL FUNC frame BF_RobTargetToFrame (robtarget rt_inputRobtT)
+!************************************************
+!*			BF_RobTargetToFrame Routine			*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+! Transform RobTarget to frame (X,Y,Z,A,B,C)
+!************************************************
+
+	VAR frame fr_returnValue;
+	
+	fr_returnValue.X:= rt_inputRobtT.trans.x;                     
+	fr_returnValue.Y:= rt_inputRobtT.trans.y;
+	fr_returnValue.Z:= rt_inputRobtT.trans.z;
+	fr_returnValue.A := EulerZYX(\Z, rt_inputRobtT.rot);	      
+	fr_returnValue.B := EulerZYX(\Y, rt_inputRobtT.rot);
+	fr_returnValue.C := EulerZYX(\X, rt_inputRobtT.rot);
+	
+	return fr_returnValue;
+	
+ENDFUNC	!(BF_RobTargetToFrame)
+
+
+LOCAL FUNC robtarget BF_PoseToRobTarget(pose pose_inputPose)
+!************************************************
+!*			BF_PoseToRobTarget Routine			*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+! Transform pose (X,Y,Z,q0,q1,q2,q3) To RobTarget
+!************************************************
+
+	VAR robtarget rt_returnValue;
+	
+	rt_returnValue.trans:=pose_inputPose.trans;
+	rt_returnValue.rot:=pose_inputPose.rot;
+	rt_returnValue.extax:=[9E9,9E9,9E9,9E9,9E9,9E9];
+	
+	return rt_returnValue;
+	
+ENDFUNC	!(BF_PoseToRobTarget)
+
+
+LOCAL FUNC pose BF_RobTargetToPose(robTarget rt_inputRobtT)
+!************************************************
+!*			BF_RobTargetToPose Routine			*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+! Transform RobTarget To pose (X,Y,Z,q0,q1,q2,q3)
+!************************************************
+
+	VAR pose pose_returnValue;
+	
+	pose_returnValue.trans:=rt_inputRobtT.trans;
+	pose_returnValue.rot:=rt_inputRobtT.rot;
+	
+	return pose_returnValue;
+	
+ENDFUNC	!(BF_RobTargetToPose)
+
+
+LOCAL FUNC pose BF_FrameToPose(frame fr_coords)
+!************************************************
+!*			BF_FrameToPose Routine				*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+! Transform frame (X,Y,Z,A,B,C) To Pose (X,Y,Z,q0,q1,q2,q3)
+!************************************************
+
+	VAR pose pose_returnVal;
+			
+	pose_returnVal.trans.x:=fr_coords.X;
+	pose_returnVal.trans.y:=fr_coords.Y;               
+	pose_returnVal.trans.z:=fr_coords.Z;
+	pose_returnVal.rot:=OrientZYX(fr_coords.A,fr_coords.B,fr_coords.C);
+	
+	return pose_returnVal;
+	
+ENDFUNC	!(BF_FrameToPose)
+
+
+LOCAL FUNC frame BF_PoseToFrame(pose pose_inputPose)
+!************************************************
+!*			BF_PoseToFrame Routine				*
+!************************************************
+! INOS internal function (LOCAL) - not to be called by the main program
+!
+! Transform Pose (X,Y,Z,A,B,C) To frame (X,Y,Z,q0,q1,q2,q3)
+!************************************************
+
+	VAR frame fr_returnValue;
+	
+	fr_returnValue.X:= pose_inputPose.trans.x;                     
+	fr_returnValue.Y:= pose_inputPose.trans.y;
+	fr_returnValue.Z:= pose_inputPose.trans.z;
+	fr_returnValue.A := EulerZYX(\Z, pose_inputPose.rot);	      
+	fr_returnValue.B := EulerZYX(\Y, pose_inputPose.rot);
+	fr_returnValue.C := EulerZYX(\X, pose_inputPose.rot);
+	
+	return fr_returnValue;
+	
+ENDFUNC	!(BF_PoseToFrame)
+
+
+PROC PowerOn24(\switch dummy)
+!************************************************
+!*			Power On event routine				*
+!************************************************
+
+	! Application identifier 
+	st_Appl_Name:="INOS Best Fit  ";
+	
+	! Function keys are not used by INOS
+	st_Appl_Key:=["1 = , 2 = , 3 = Setup","1 = , 2 = , 3 = Setup","???"];
+ 
+ENDPROC	!(PowerOn24)
+
+
+PROC InitAppl24(\switch dummy)
+!************************************************
+!*			Init application routine			*
+!************************************************
+
+	n_Inos_Error_Code:=0;
+	
+	Reset PLC_do_BF_Busy;
+	Reset PLC_do_BF_Meas_Err;
+	Set PLC_do_BF_Ready;
+
+ENDPROC	!(InitAppl24)
+
+ENDMODULE
